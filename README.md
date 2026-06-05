@@ -1,2 +1,170 @@
-# pug-bot-tf2
-A TF2 PUG bot built by yuna
+# TF2 PUG Bot
+
+A Discord bot that organises **6v6 Team Fortress 2 pickup games (PUGs)** — queueing, auto-ready checks, captain drafting, and a medic-immunity rotation so the same people don't get stuck medding every game.
+
+Built with [discord.py](https://github.com/Rapptz/discord.py) (slash commands + classic `++` shortcuts). State is in-memory; no database required to run.
+
+---
+
+## Features
+
+- **Queue** with `++` / `/add`, live roster display, and a 2-hour idle timeout.
+- **Auto-ready windows** — joining confirms your participation automatically for a window (2 min default, 15 min via `!ar`, or a custom value up to 30 min). No need to babysit the queue.
+- **Ready check** when the queue fills: a 60-second confirmation with **Ready** and **Abort** buttons. Anyone whose auto-ready window is still open is confirmed instantly; anyone who doesn't ready up in time is dropped.
+- **Captain draft** — two captains are rolled (excluding medic-immune players), but anyone in the match can volunteer with `/capfor`, and captains can step down with `/capoff`.
+- **Snake-ish pick order** (`1-2-1-1-1-1-1-1-1`) that produces balanced 6v6 teams, with the captains as the two medics.
+- **Medic immunity** — whoever captains/medics a game gets immunity for their next **2** games (so they won't be forced to med again), tracked per-player, capped, and non-stacking.
+- **Substitutions** during the draft stage (`/subme` to request, `/subfor` to fill).
+- **Admin controls** — `/match report` (end a live game or cancel a forming one), `/reset` (re-roll a stuck draft), `/clear`, and `/forceadd` (rebuild a queue, e.g. after a restart).
+- **Debug harness** (opt-in) for testing the full flow solo without 12 humans.
+
+---
+
+## How a PUG flows
+
+The bot is a small state machine. Each command only works in the phase where it makes sense, which is what keeps the edge cases (double picks, queueing onto the next game early, picking out of turn) from happening.
+
+```
+IDLE → QUEUING → READY_CHECK → PICKING → LIVE → (report) → IDLE
+```
+
+1. **QUEUING** — players `++` until the queue reaches 12.
+2. **READY_CHECK** — everyone confirms (auto-ready or the Ready button) within 60s; stragglers are dropped.
+3. **PICKING** — two captains claim sides and draft the rest, alternating per the pick order.
+4. **LIVE** — teams are set; the game is played, then reported to reopen the queue.
+
+---
+
+## Commands
+
+### Players
+
+| Command | What it does |
+|---|---|
+| `++` / `/add` | Join the queue (2-min auto-ready) |
+| `!ar` / `/ar` | Join with a 15-min auto-ready window |
+| `/auto-ready <min>` | Join with a custom auto-ready window (max 30 min) |
+| `--` / `/leave` | Leave the queue |
+| `/aroff` | Turn off your auto-ready (ready up manually) |
+| `/ready` | Confirm in a ready check (or just click the button) |
+| `/queue` | Show the queue, or the teams if a game is on |
+| `/capfor red\|blu` | Volunteer to captain a side |
+| `/capoff` | Step down as captain |
+| `/pick @player` | Draft a player (current picker only) |
+| `/subme` | Request a substitute (draft stage only) |
+| `/subfor [@player]` | Sub in for someone (draft stage only) |
+| `/commands` | Show the command list |
+
+### Admin
+
+| Command | What it does |
+|---|---|
+| `/match report` | End a live game (captain/admin) or cancel a forming match (admin) |
+| `/reset` | Unstick a frozen draft by re-rolling captains |
+| `/clear` | Clear the queue |
+| `/forceadd @a @b …` | Add players to the queue by mention (e.g. after a restart) |
+
+"Admin" means a member with Discord's **Administrator** permission, or the `PUG Admin` role.
+
+### Debug (only when `PUG_DEBUG=1`, admin-only)
+
+`/fill`, `/forceready`, `/autopick`, `/botcap`, `/botpick`, `/pickname` — fill the queue with fake players and step through the ready check and draft solo. Hidden entirely when `PUG_DEBUG` is unset.
+
+---
+
+## Architecture
+
+Two files, deliberately separated:
+
+- **`pug_state.py`** — all game logic, with **no `discord` import**. It's a plain `PugState` class: every command is a method that checks the phase/turn/identity guards and returns `(ok, msg)`. Because it has no Discord dependency, the entire rule set is unit-testable in isolation.
+- **`bot.py`** — the Discord layer. It maps slash commands, buttons, and timers onto `PugState` calls and handles all rendering (embeds, mentions, ready-check buttons). It holds no game rules of its own.
+
+This split is the point: UI changes (slash commands, embeds, name formatting) never touch the logic, and logic changes are verified by tests that never need a live bot.
+
+---
+
+## Setup
+
+Requirements: **Python 3.10+** and **discord.py ≥ 2.3**.
+
+```bash
+pip install -U "discord.py>=2.3"
+```
+
+1. Create an application at the [Discord Developer Portal](https://discord.com/developers/applications) → **Bot** → reset and copy the token.
+2. Under **Bot → Privileged Gateway Intents**, enable **Message Content Intent** (for `++` / `!ar`) and **Server Members Intent** (so display names resolve).
+3. **OAuth2 → URL Generator**: scope `bot`, permissions *Send Messages* + *Read Message History*. Open the URL to invite the bot.
+4. Create a role named **`PUG Admin`** and assign it to your admins.
+
+---
+
+## Running
+
+Configured entirely through environment variables:
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `DISCORD_TOKEN` | yes | Your bot token |
+| `TEST_GUILD_ID` | no | A server ID for **instant** slash-command sync during development. Omit for global sync (can take ~1h to propagate). |
+| `PUG_DEBUG` | no | Set to `1` to enable the debug commands. |
+
+```bash
+# Production
+DISCORD_TOKEN=xxxxx python bot.py
+
+# Development (instant command sync + debug tools)
+DISCORD_TOKEN=xxxxx TEST_GUILD_ID=123456789012345678 PUG_DEBUG=1 python bot.py
+```
+
+**Never commit your token.** Keep it in your shell environment or a local file that's in `.gitignore`.
+
+A minimal `.gitignore`:
+
+```
+__pycache__/
+*.pyc
+.env
+```
+
+---
+
+## Configuration
+
+Tunable constants live at the top of `pug_state.py`:
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `QUEUE_SIZE` | 12 | Players needed to start (6v6) |
+| `TIMEOUT_SECONDS` | 7200 | Idle drop while queuing (2 hours) |
+| `IMMUNITY_GAMES` | 2 | Games of med-immunity granted after medding |
+| `DEFAULT_AR_SECONDS` | 120 | Auto-ready window for `++` / `/add` |
+| `AR_COMMAND_SECONDS` | 900 | Auto-ready window for `!ar` / `/ar` |
+| `MAX_AR_SECONDS` | 1800 | Hard cap on `/auto-ready` |
+| `READY_CHECK_SECONDS` | 60 | Ready-up window once the queue fills |
+| `PICK_ORDER` | `1-2-1-1-1-1-1-1-1` | Per-turn pick counts (RED first) |
+
+---
+
+## Testing
+
+`pug_state.py` ships with a smoke-test suite covering the full rule set — pick-order balance, the auto-ready / ready-check paths, medic immunity (including no-stacking and exclusion from the captain roll), subs, captain step-down, and the abort flow:
+
+```bash
+python pug_state.py
+```
+
+It drives complete games (queue → ready → draft → live) without Discord, using an injectable clock to test the time-based logic deterministically.
+
+---
+
+## Limitations & roadmap
+
+- **In-memory only.** Restarting the bot wipes the queue, immunity, and any active match. This is intentional for simplicity; persistence (SQLite) is the natural next step and would also enable match history and player stats.
+- **No server orchestration.** This bot organises the lobby on Discord only — it doesn't touch a game server (RCON, map changes, logs).
+- Possible future additions: persistent immunity/stats, per-player class preferences, a ready-up timer for captain selection, and match IDs.
+
+---
+
+## License
+
+Choose one (MIT is a sensible default) and add a `LICENSE` file.
