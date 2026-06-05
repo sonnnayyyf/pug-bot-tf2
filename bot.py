@@ -15,8 +15,6 @@ import random
 import difflib
 import re
 from typing import Optional
-from dotenv import load_dotenv
-load_dotenv()
 
 import discord
 from discord import app_commands
@@ -25,6 +23,14 @@ from discord.ext import tasks
 from pug_state import (PugState, Phase, QUEUE_SIZE,
                        DEFAULT_AR_SECONDS, AR_COMMAND_SECONDS,
                        MAX_AR_SECONDS, READY_CHECK_SECONDS, TIMEOUT_SECONDS)
+
+# Load DISCORD_TOKEN / TEST_GUILD_ID / PUG_DEBUG from a local .env file if
+# python-dotenv is installed; otherwise fall back to shell environment vars.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 ADMIN_ROLE = "PUG Admin"
 
@@ -45,7 +51,7 @@ def display_name(guild, uid) -> str:
     if uid in FAKE_NAMES:
         return FAKE_NAMES[uid]
     member = guild.get_member(uid) if guild else None
-    return member.display_name if member else str(uid)
+    return member.name if member else str(uid)   # .name = Discord username, ignores nicknames
 
 
 def name_box(guild, uid) -> str:
@@ -113,9 +119,12 @@ def queue_display(guild) -> str:
 
 
 def ready_menu(guild) -> str:
+    # plain-text message (not an embed), so these mentions DO notify — that's
+    # intended: the 12 get pinged once when the check starts. Editing the
+    # message as people ready up does not re-ping.
     ready, not_ready = pug.ready_status()
-    r = " / ".join(name_box(guild, u) for u in ready) or "—"
-    n = " / ".join(name_box(guild, u) for u in not_ready) or "—"
+    r = " / ".join(player_tag(guild, u) for u in ready) or "—"
+    n = " / ".join(player_tag(guild, u) for u in not_ready) or "—"
     return ("**Ready check!** Click **Ready** within "
             f"{READY_CHECK_SECONDS}s or you're dropped.\n"
             f"✅ Ready ({len(ready)}/{QUEUE_SIZE}): {r}\n"
