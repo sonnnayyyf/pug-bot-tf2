@@ -32,7 +32,7 @@ IMMUNITY_GAMES = 2               # med-immunity granted on medding (no stacking)
 DEFAULT_AR_SECONDS = 2 * 60      # ++ / /add
 AR_COMMAND_SECONDS = 15 * 60     # !ar / /ar
 MAX_AR_SECONDS = 30 * 60         # /auto-ready hard cap
-READY_CHECK_SECONDS = 60         # window to ready up once queue is full
+READY_CHECK_SECONDS = 120        # window to ready up once queue is full (2 min)
 
 # RED first. (team, picks_this_turn). 1-2-1-1-1-1-1-1-1 -> 5/5 picks = 6v6.
 PICK_ORDER = [
