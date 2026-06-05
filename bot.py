@@ -126,7 +126,7 @@ def ready_menu(guild) -> str:
     r = " / ".join(player_tag(guild, u) for u in ready) or "—"
     n = " / ".join(player_tag(guild, u) for u in not_ready) or "—"
     return ("**Ready check!** Click **Ready** within "
-            f"{READY_CHECK_SECONDS}s or you're dropped.\n"
+            f"{fmt_dur(READY_CHECK_SECONDS)} or you're dropped.\n"
             f"✅ Ready ({len(ready)}/{QUEUE_SIZE}): {r}\n"
             f"⌛ Waiting: {n}")
 
