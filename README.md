@@ -88,7 +88,7 @@ This split is the point: UI changes (slash commands, embeds, name formatting) ne
 Requirements: **Python 3.10+** and **discord.py ≥ 2.3**.
 
 ```bash
-pip install -U "discord.py>=2.3"
+pip install -U "discord.py>=2.3" python-dotenv
 ```
 
 1. Create an application at the [Discord Developer Portal](https://discord.com/developers/applications) → **Bot** → reset and copy the token.
@@ -100,7 +100,7 @@ pip install -U "discord.py>=2.3"
 
 ## Running
 
-Configured entirely through environment variables:
+Configuration is read from environment variables, loaded from a local `.env` file (via `python-dotenv`) or from your shell.
 
 | Variable | Required | Purpose |
 |---|---|---|
@@ -108,22 +108,32 @@ Configured entirely through environment variables:
 | `TEST_GUILD_ID` | no | A server ID for **instant** slash-command sync during development. Omit for global sync (can take ~1h to propagate). |
 | `PUG_DEBUG` | no | Set to `1` to enable the debug commands. |
 
-```bash
-# Production
-DISCORD_TOKEN=xxxxx python bot.py
+Create a `.env` file in the project root:
 
-# Development (instant command sync + debug tools)
-DISCORD_TOKEN=xxxxx TEST_GUILD_ID=123456789012345678 PUG_DEBUG=1 python bot.py
+```
+DISCORD_TOKEN=your_actual_token_here
+TEST_GUILD_ID=your_server_id_here
 ```
 
-**Never commit your token.** Keep it in your shell environment or a local file that's in `.gitignore`.
+Then run:
+
+```bash
+python bot.py
+
+# Enable the debug tools for a run:
+PUG_DEBUG=1 python bot.py
+```
+
+**Never commit your token.** The `.env` file is git-ignored (see below).
 
 A minimal `.gitignore`:
 
 ```
+.env
 __pycache__/
 *.pyc
-.env
+.vscode/
+.DS_Store
 ```
 
 ---
