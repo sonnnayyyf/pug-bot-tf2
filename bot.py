@@ -439,6 +439,26 @@ async def match_report_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(f"{mentions} {msg}" if mentions else msg)
 
 
+@match_group.command(name="put", description="Admin: move a player onto a team, or bench them.")
+@app_commands.describe(player="Player to move", team="Target: a team, or the bench")
+@app_commands.choices(team=[
+    app_commands.Choice(name="RED", value="red"),
+    app_commands.Choice(name="BLU", value="blu"),
+    app_commands.Choice(name="Bench", value="bench"),
+])
+async def match_put_cmd(interaction: discord.Interaction,
+                        player: discord.Member, team: app_commands.Choice[str]):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    ok, msg = pug.match_put(player.id, team.value)
+    if not ok:
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+    embed = final_embed(interaction.guild) if pug.phase is Phase.LIVE else draft_embed(interaction.guild)
+    await interaction.response.send_message(embed=embed)
+
+
 client.tree.add_command(match_group)
 
 
@@ -483,6 +503,54 @@ async def forceadd_cmd(interaction: discord.Interaction, players: str):
         await interaction.response.send_message(queue_display(interaction.guild))
 
 
+immunity_group = app_commands.Group(name="immunity", description="Admin: manage med immunity.")
+
+
+@immunity_group.command(name="show", description="Show who currently has med immunity.")
+async def immunity_show_cmd(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    imm = pug.immunity_list()
+    if not imm:
+        await interaction.response.send_message("No one has med immunity.", ephemeral=True)
+        return
+    lines = [f"{name_box(interaction.guild, u)} — x{n}" for u, n in imm.items()]
+    await interaction.response.send_message("**Med immunity:**\n" + "\n".join(lines))
+
+
+@immunity_group.command(name="set", description="Set a player's med immunity to an exact number of games.")
+@app_commands.describe(player="Player", games="Games of immunity (0 to remove)")
+async def immunity_set_cmd(interaction: discord.Interaction,
+                           player: discord.Member, games: app_commands.Range[int, 0, 20]):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.send_message(pug.set_immunity(player.id, games)[1])
+
+
+@immunity_group.command(name="add", description="Add (or subtract) med immunity by an amount.")
+@app_commands.describe(player="Player", games="Amount to add (use a negative number to subtract)")
+async def immunity_add_cmd(interaction: discord.Interaction,
+                           player: discord.Member, games: app_commands.Range[int, -20, 20]):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.send_message(pug.add_immunity(player.id, games)[1])
+
+
+@immunity_group.command(name="clear", description="Remove a player's med immunity.")
+@app_commands.describe(player="Player")
+async def immunity_clear_cmd(interaction: discord.Interaction, player: discord.Member):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.send_message(pug.clear_immunity(player.id)[1])
+
+
+client.tree.add_command(immunity_group)
+
+
 @client.tree.command(name="clear", description="Admin: clear the queue.")
 async def clear_cmd(interaction: discord.Interaction):
     if not is_admin(interaction.user):
@@ -518,6 +586,8 @@ async def commands_cmd(interaction: discord.Interaction):
         "`/pick @user` — draft a player\n"
         "`/subme` — request a sub · `/subfor` — sub in (draft stage)\n"
         "`/match report` — end/cancel a match\n"
+        "`/match put @player red|blu|bench` — admin: move a player to a team or bench\n"
+        "`/immunity show|set|add|clear` — admin: manage med immunity\n"
         "`/reset` · `/clear` · `/forceadd` — admin"
     )
     await interaction.response.send_message(text, ephemeral=True)
