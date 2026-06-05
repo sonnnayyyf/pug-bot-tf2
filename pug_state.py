@@ -327,6 +327,47 @@ class PugState:
             return True, "your match has been canceled.", players
         return False, "No match to report.", []
 
+    def match_put(self, uid, where):
+        """Admin: move a player onto a team, or to the bench (off all teams).
+        Used to rebalance. Captains must step down (/capoff) before being moved."""
+        if self.phase not in (Phase.PICKING, Phase.LIVE):
+            return False, "No teams to move players between yet."
+        where = where.upper()
+        if where not in ("RED", "BLU", "BENCH"):
+            return False, "Target must be red, blu, or bench."
+        if uid not in self.queue:
+            return False, "That player isn't in this match."
+        if uid in self.capt_of.values():
+            return False, "That player is a captain — use /capoff first."
+        for c in ("RED", "BLU"):
+            if uid in self.team[c]:
+                self.team[c].remove(uid)
+        if where == "BENCH":
+            return True, f"Moved <@{uid}> to the bench."
+        if uid not in self.team[where]:
+            self.team[where].append(uid)
+        return True, f"Moved <@{uid}> to {where}."
+
+    # ---------- immunity admin ----------
+    def immunity_list(self):
+        return dict(self.immunity)
+
+    def set_immunity(self, uid, games):
+        games = max(0, int(games))
+        if games == 0:
+            self.immunity.pop(uid, None)
+        else:
+            self.immunity[uid] = games
+        return True, f"<@{uid}> med-immunity set to {games}."
+
+    def add_immunity(self, uid, delta):
+        return self.set_immunity(uid, self.immunity.get(uid, 0) + int(delta))
+
+    def clear_immunity(self, uid):
+        had = self.immunity.pop(uid, None)
+        return True, (f"<@{uid}> med-immunity cleared." if had
+                      else f"<@{uid}> had no immunity.")
+
     def admin_reset(self):
         """Unstick a frozen pick: same 12 players, re-roll captains."""
         players = dict(self.queue)
@@ -492,5 +533,30 @@ if __name__ == "__main__":
     assert 2 in s.queue                         # the OTHER unready player is kept
     assert len(s.queue) == 11 and s.phase is Phase.QUEUING
     print("K) abort removes only the aborter; other unready players stay")
+
+    # L) /match put moves a player between teams (and off the bench)
+    clock["t"] = 1000.0
+    s = fresh(); fill(s, P); caps = drive_draft(s)
+    assert s.phase is Phase.LIVE
+    # pick a RED pick and move them to BLU
+    mover = s.team["RED"][0]
+    n_red, n_blu = len(s.team["RED"]), len(s.team["BLU"])
+    assert s.match_put(mover, "blu")[0] is True
+    assert mover in s.team["BLU"] and mover not in s.team["RED"]
+    assert len(s.team["RED"]) == n_red - 1 and len(s.team["BLU"]) == n_blu + 1
+    assert s.match_put(caps[0], "blu")[0] is False   # can't move a captain
+    # bench a player: removed from teams but still in the match (unpicked)
+    assert s.match_put(mover, "bench")[0] is True
+    assert mover not in s.team["RED"] and mover not in s.team["BLU"]
+    assert mover in s.queue and mover in s.unpicked()
+    print("L) /match put moves players between teams and to the bench; captains protected")
+
+    # M) admin immunity management
+    s = fresh()
+    s.set_immunity(42, 3); assert s.immunity[42] == 3
+    s.add_immunity(42, -1); assert s.immunity[42] == 2
+    s.add_immunity(42, -5); assert 42 not in s.immunity     # clamps to 0 -> removed
+    s.set_immunity(42, 2); s.clear_immunity(42); assert 42 not in s.immunity
+    print("M) admin immunity set/add/clear works and clamps at 0")
 
     print("\nall smoke tests passed.")
