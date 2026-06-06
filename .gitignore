@@ -1,0 +1,16 @@
+# secrets / env
+.env
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# editor / OS
+.vscode/
+.DS_Store
+
+# runtime state (never commit)
+pug.db
+pug.db-journal
+pug.db-wal
