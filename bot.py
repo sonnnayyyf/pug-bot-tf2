@@ -26,7 +26,8 @@ from storage import Store
 
 from pug_state import (PugState, Phase, QUEUE_SIZE,
                        DEFAULT_AR_SECONDS, AR_COMMAND_SECONDS,
-                       MAX_AR_SECONDS, READY_CHECK_SECONDS, TIMEOUT_SECONDS)
+                       MAX_AR_SECONDS, READY_CHECK_SECONDS, TIMEOUT_SECONDS,
+                       LIVE_AUTO_REPORT_SECONDS)
 
 # Load DISCORD_TOKEN / TEST_GUILD_ID / PUG_DEBUG from a local .env file if
 # python-dotenv is installed; otherwise fall back to shell environment vars.
@@ -59,6 +60,11 @@ SKILL_ROLES = [
 # from Discord with Developer Mode on: right-click the channel > Copy Channel ID.
 # Leave unset to allow the bot in every channel (old behaviour).
 PUG_CHANNEL_ID = int(os.environ["PUG_CHANNEL_ID"]) if os.environ.get("PUG_CHANNEL_ID") else None
+
+# Channel where players post/find the server connect string. Shown on the live
+# teams embed so people know where to go. Set CONNECT_CHANNEL_ID (channel ID) to
+# make it a clickable #mention; left unset, a plain "#connect-string" is shown.
+CONNECT_CHANNEL_ID = int(os.environ["CONNECT_CHANNEL_ID"]) if os.environ.get("CONNECT_CHANNEL_ID") else None
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -253,6 +259,8 @@ def final_embed(guild) -> discord.Embed:
         lines.append(f"{dot[color]} **{color}**")
         lines.append(team_roster(guild, color))
     lines.append("—")
+    connect = f"<#{CONNECT_CHANNEL_ID}>" if CONNECT_CHANNEL_ID else "#connect-string"
+    lines.append(f"➡️ Head to {connect} to join the server.")
     lines.append("Admins: /match report to end or cancel.")
     return discord.Embed(title="Teams set — GLHF!",
                          description="\n".join(lines),
@@ -271,6 +279,26 @@ class ReadyView(discord.ui.View):
     async def start(self):
         self.message = await self.channel.send(ready_menu(self.guild), view=self)
         self.deadline = asyncio.create_task(self._expire())
+
+    async def refresh(self):
+        """Re-render the ready menu (e.g. after someone armed auto-ready via command)."""
+        if self.message:
+            try:
+                await self.message.edit(content=ready_menu(self.guild), view=self)
+            except discord.HTTPException:
+                pass
+
+    async def finish_draft(self):
+        """All players ready -> close the check and post the draft board."""
+        if self.deadline:
+            self.deadline.cancel()
+        self.stop()
+        if self.message:
+            try:
+                await self.message.edit(content="**All players ready!**", view=None)
+            except discord.HTTPException:
+                pass
+        await self.channel.send(embed=draft_embed(self.guild))
 
     async def _expire(self):
         try:
@@ -458,15 +486,25 @@ class PugClient(discord.Client):
             await self._text_add(message, AR_COMMAND_SECONDS)
         elif text == "--":
             ok, msg = pug.remove(message.author.id)
-            await message.channel.send(queue_display(message.guild) if ok else msg)
+            if not ok:
+                await message.channel.send(msg)
+            elif pug.slot_busy:                  # they left the NEXT queue (a game is on)
+                await message.channel.send(next_queue_display(message.guild))
+            else:
+                await message.channel.send(queue_display(message.guild))
 
     async def _text_add(self, message, ar):
         uid = message.author.id
+        in_check = pug.phase is Phase.READY_CHECK and uid in pug.queue
         busy = pug.slot_busy
         already = uid in pug.queue or uid in pug.next_queue
         ok, msg = pug.add(uid, ar)
         if not ok:
             await message.channel.send(msg)
+            return
+        if in_check:                              # armed auto-ready mid ready-check
+            await self._after_ready_arm(message.channel, message.guild, ar,
+                                        lambda **k: message.channel.send(**k))
             return
         async def confirm(content=None, embed=None):
             await message.channel.send(content=content, embed=embed)
@@ -478,6 +516,23 @@ class PugClient(discord.Client):
             await announce_after_add(message.channel, message.guild, ar, confirm,
                                      reprint=not already)
 
+    async def _after_ready_arm(self, channel, guild, ar, reply):
+        """Shared rendering after a player arms auto-ready during a ready check:
+        they're confirmed now; if that completed the check, launch the draft,
+        otherwise refresh the ready menu so they show as ready."""
+        view = _active_ready_view
+        if pug.phase is Phase.PICKING:            # they were the last needed
+            if view:
+                await view.finish_draft()
+            else:
+                await channel.send(embed=draft_embed(guild))
+            await reply(content=f"Auto-ready set ({fmt_dur(ar)}) — you're confirmed, draft starting.")
+        else:
+            if view:
+                await view.refresh()
+            await reply(content=f"Auto-ready set ({fmt_dur(ar)}) — you're readied now, and "
+                                "auto-confirmed if the ready check restarts.")
+
 
 client = PugClient()
 
@@ -487,11 +542,19 @@ async def _slash_add(interaction: discord.Interaction, ar: int):
     global _last_channel
     _last_channel = interaction.channel
     uid = interaction.user.id
+    in_check = pug.phase is Phase.READY_CHECK and uid in pug.queue
     busy = pug.slot_busy
     already = uid in pug.queue or uid in pug.next_queue
     ok, msg = pug.add(uid, ar)
     if not ok:
         await interaction.response.send_message(msg, ephemeral=True)
+        return
+    if in_check:                              # armed auto-ready mid ready-check
+        replied = {"v": False}
+        async def reply(content=None):
+            replied["v"] = True
+            await interaction.response.send_message(content, ephemeral=True)
+        await client._after_ready_arm(interaction.channel, interaction.guild, ar, reply)
         return
     async def confirm(content=None, embed=None):
         await interaction.response.send_message(content=content, embed=embed)
@@ -523,8 +586,12 @@ async def auto_ready_cmd(interaction: discord.Interaction, minutes: app_commands
 @client.tree.command(name="leave", description="Leave the queue.")
 async def leave_cmd(interaction: discord.Interaction):
     ok, msg = pug.remove(interaction.user.id)
-    await interaction.response.send_message(
-        queue_display(interaction.guild) if ok else msg, ephemeral=not ok)
+    if not ok:
+        await interaction.response.send_message(msg, ephemeral=True)
+    elif pug.slot_busy:                          # they left the NEXT queue (a game is on)
+        await interaction.response.send_message(next_queue_display(interaction.guild))
+    else:
+        await interaction.response.send_message(queue_display(interaction.guild))
 
 
 @client.tree.command(name="aroff", description="Turn off your auto-ready (ready up manually).")
@@ -823,6 +890,16 @@ async def timeout_sweep():
         names = ", ".join(f"<@{uid}>" for uid in dropped)   # real ping so they're notified
         hours = TIMEOUT_SECONDS // 3600
         await _last_channel.send(f"{names} were removed from all queues (idle {hours}h).")
+    # auto-end a live game nobody reported (captains forget; ~50 min cap)
+    finished = pug.check_live_timeout()
+    if finished is not None and _last_channel:
+        mins = LIVE_AUTO_REPORT_SECONDS // 60
+        names = ", ".join(f"<@{uid}>" for uid in finished)
+        await _last_channel.send(
+            f"{names} game auto-ended after {mins} min (no /match report). "
+            "Queue open — /add to join.")
+        if pug.queue_ids():                       # a next queue may have been promoted
+            await render_active(_last_channel, _last_channel.guild)
 
 
 @tasks.loop(seconds=5)
