@@ -33,6 +33,7 @@ DEFAULT_AR_SECONDS = 2 * 60      # ++ / /add
 AR_COMMAND_SECONDS = 15 * 60     # !ar / /ar
 MAX_AR_SECONDS = 30 * 60         # /auto-ready hard cap
 READY_CHECK_SECONDS = 120        # window to ready up once queue is full (2 min)
+LIVE_AUTO_REPORT_SECONDS = 50 * 60  # auto-end a live game if no one reports (50 min)
 
 # RED first. (team, picks_this_turn). 1-2-1-1-1-1-1-1-1 -> 5/5 picks = 6v6.
 PICK_ORDER = [
@@ -60,6 +61,7 @@ class PugState:
         self.turn_idx = 0
         self.picks_left = 0
         self.sub_requests = []
+        self.live_since = None        # epoch the game went LIVE (for auto-report)
 
     def reset_all(self):
         self.immunity = {}
@@ -83,6 +85,7 @@ class PugState:
             "immunity": self.immunity,
             "auto_ready_until": self.auto_ready_until,
             "next_queue": self.next_queue,
+            "live_since": self.live_since,
         }
 
     def load_dict(self, d):
@@ -108,6 +111,7 @@ class PugState:
         self.immunity = ints(d.get("immunity"))
         self.auto_ready_until = ints(d.get("auto_ready_until"))
         self.next_queue = ints(d.get("next_queue"))
+        self.live_since = d.get("live_since")
 
     # ---------- helpers ----------
     @property
@@ -148,6 +152,11 @@ class PugState:
         Re-arms auto-ready if already queued."""
         ar_seconds = min(ar_seconds, MAX_AR_SECONDS)
         self.auto_ready_until[uid] = self._now() + ar_seconds
+        # Already in a live ready check: arming auto-ready confirms them now AND
+        # (since the window is open) re-confirms them automatically if the check
+        # has to restart after a timeout/abort — so they never re-click Ready.
+        if self.phase == Phase.READY_CHECK and uid in self.queue:
+            return self.mark_ready(uid)
         if self.slot_busy:
             if uid in self.queue:
                 return False, "You're in the current game. /match report to end it first."
@@ -319,6 +328,15 @@ class PugState:
                               f"/capfor {color.lower()} to take it.")
         return False, "You're not a captain."
 
+    def _advance_pick(self):
+        """Consume the current pick slot; move to the next, or go live if done."""
+        if self.picks_left == 0:
+            self.turn_idx += 1
+            if self.turn_idx >= len(PICK_ORDER):
+                self._go_live()
+            else:
+                self.picks_left = PICK_ORDER[self.turn_idx][1]
+
     def pick(self, uid, target):
         if self.phase != Phase.PICKING:
             return False, "Not in picking phase."
@@ -330,19 +348,42 @@ class PugState:
             return False, "That player isn't in this game."
         if target in self._drafted():
             return False, "Already picked."
-        self.team[self._current_team()].append(target)
+        team = self._current_team()
+        self.team[team].append(target)
         self.picks_left -= 1
-        if self.picks_left == 0:
-            self.turn_idx += 1
-            if self.turn_idx >= len(PICK_ORDER):
-                return self._go_live()
-            self.picks_left = PICK_ORDER[self.turn_idx][1]
-        return True, f"<@{target}> -> {self._current_team()}. Next: <@{self._current_picker()}>."
+        self._advance_pick()
+        if self.phase is Phase.LIVE:
+            return True, f"<@{target}> -> {team}. Teams set. GLHF!"
+        # Only one player left? Their team is forced, so auto-assign instead of
+        # making the other captain waste a turn on a no-choice pick.
+        remaining = self.unpicked()
+        if len(remaining) == 1:
+            last, last_team = remaining[0], self._current_team()
+            self.team[last_team].append(last)
+            self.picks_left -= 1
+            self._advance_pick()
+            return True, (f"<@{target}> -> {team}. <@{last}> auto-assigned to {last_team}. "
+                          "Teams set — GLHF!")
+        return True, f"<@{target}> -> {team}. Next: <@{self._current_picker()}>."
 
     def _go_live(self):
         self._apply_immunity()
         self.phase = Phase.LIVE
+        self.live_since = self._now()
         return True, "Teams set. GLHF!"
+
+    def check_live_timeout(self):
+        """Auto-end a live game that's run past the report window (handles
+        captains forgetting to /match report). Promotes any next queue, same as
+        a manual report. Returns the finished game's players, or None if nothing
+        timed out."""
+        if self.phase is not Phase.LIVE or self.live_since is None:
+            return None
+        if self._now() - self.live_since < LIVE_AUTO_REPORT_SECONDS:
+            return None
+        players = list(self.queue.keys())
+        self._end_and_promote()
+        return players
 
     def _apply_immunity(self):
         caps = set(self.capt_of.values())     # whoever actually captained/medded
@@ -748,5 +789,50 @@ if __name__ == "__main__":
     s.admin_clear()
     assert s.phase is Phase.IDLE and s.queue_ids() == []
     print("R) /clear scopes to the next queue mid-game, full queue otherwise")
+
+    # S) the forced last unpicked player is auto-assigned (draft ends a pick early)
+    clock["t"] = 11000.0
+    s = fresh(); fill(s, P)
+    caps = list(s.captains)
+    s.capfor(caps[0], "red"); s.capfor(caps[1], "blu")
+    while len(s.unpicked()) > 1 and s.phase is Phase.PICKING:
+        s.pick(s._current_picker(), s.unpicked()[0])
+    assert s.phase is Phase.LIVE                       # auto-assign finished it
+    assert s.unpicked() == []                          # nobody left hanging
+    assert sorted(s.team["RED"] + s.team["BLU"] + list(s.capt_of.values())) == P
+    assert len(s.team["RED"]) == 5 and len(s.team["BLU"]) == 5
+    print("S) the forced last player is auto-assigned; draft finishes one pick early")
+
+    # T) arming auto-ready during a ready check confirms the player
+    clock["t"] = 12000.0
+    s = fresh()
+    for p in range(1, 12):
+        s.add(p)                                       # 1..11 auto-ready, QUEUING
+    s.clear_auto_ready(10); s.clear_auto_ready(11)     # two opt out of auto-ready
+    s.add(12)                                          # fills -> ready check (not auto-draft)
+    assert s.phase is Phase.READY_CHECK
+    assert 10 not in s.ready and 11 not in s.ready and 12 in s.ready
+    ok, _ = s.add(10, AR_COMMAND_SECONDS)              # 10 arms AR mid-check
+    assert ok and 10 in s.ready                        # confirmed now
+    assert s.auto_ready_until[10] > NOW()              # and armed for a restart
+    assert s.phase is Phase.READY_CHECK                # 11 still not ready -> check continues
+    ok, _ = s.add(11, AR_COMMAND_SECONDS)              # last one arms AR
+    assert ok and s.phase is Phase.PICKING             # completes the check -> draft
+    print("T) arming auto-ready during a ready check confirms the player (and completes it when last)")
+
+    # U) a live game auto-ends after the report window (captains forgot)
+    clock["t"] = 13000.0
+    s = fresh(); fill(s, P); caps = drive_draft(s)        # LIVE
+    for x in (201, 202): s.add(x)                          # next queue waiting
+    assert s.check_live_timeout() is None                  # not time yet
+    clock["t"] = 13000.0 + LIVE_AUTO_REPORT_SECONDS - 1
+    assert s.check_live_timeout() is None                  # still under the limit
+    clock["t"] = 13000.0 + LIVE_AUTO_REPORT_SECONDS + 1
+    finished = s.check_live_timeout()
+    assert finished is not None and len(finished) == 12    # the 12 who were playing
+    assert set(s.queue) == {201, 202}                       # next queue promoted
+    assert s.live_since is None                             # clock reset
+    assert s.check_live_timeout() is None                   # idempotent (no longer LIVE)
+    print("U) live games auto-report after the time limit and promote the next queue")
 
     print("\nall smoke tests passed.")
