@@ -67,6 +67,48 @@ class PugState:
         self.next_queue = {}
         self.reset_match()
 
+    # ---------- serialization (for persistence; pure, no DB here) ----------
+    def to_dict(self):
+        """All state as JSON-safe primitives. The bot persists this snapshot."""
+        return {
+            "phase": self.phase.name,
+            "queue": self.queue,
+            "ready": list(self.ready),
+            "captains": list(self.captains),
+            "team": {"RED": list(self.team["RED"]), "BLU": list(self.team["BLU"])},
+            "capt_of": dict(self.capt_of),
+            "turn_idx": self.turn_idx,
+            "picks_left": self.picks_left,
+            "sub_requests": list(self.sub_requests),
+            "immunity": self.immunity,
+            "auto_ready_until": self.auto_ready_until,
+            "next_queue": self.next_queue,
+        }
+
+    def load_dict(self, d):
+        """Restore a snapshot from to_dict. Tolerant of JSON's string dict keys
+        (uids come back as ints either way). Unknown/missing fields fall back to
+        empty defaults so an old or partial snapshot can't crash startup."""
+        def ints(m):                       # uid-keyed map -> int keys + int/num vals kept
+            return {int(k): v for k, v in (m or {}).items()}
+        try:
+            self.phase = Phase[d.get("phase", "IDLE")]
+        except KeyError:
+            self.phase = Phase.IDLE
+        self.queue = ints(d.get("queue"))
+        self.ready = {int(u) for u in d.get("ready", [])}
+        self.captains = [int(u) for u in d.get("captains", [])]
+        team = d.get("team") or {}
+        self.team = {"RED": [int(u) for u in team.get("RED", [])],
+                     "BLU": [int(u) for u in team.get("BLU", [])]}
+        self.capt_of = {k: int(v) for k, v in (d.get("capt_of") or {}).items()}
+        self.turn_idx = int(d.get("turn_idx", 0))
+        self.picks_left = int(d.get("picks_left", 0))
+        self.sub_requests = [int(u) for u in d.get("sub_requests", [])]
+        self.immunity = ints(d.get("immunity"))
+        self.auto_ready_until = ints(d.get("auto_ready_until"))
+        self.next_queue = ints(d.get("next_queue"))
+
     # ---------- helpers ----------
     @property
     def _both_capts_set(self):
@@ -383,7 +425,8 @@ class PugState:
 
     def match_put(self, uid, where):
         """Admin: move a player onto a team, or to the bench (off all teams).
-        Used to rebalance. Captains must step down (/capoff) before being moved."""
+        Used to rebalance. Moving a captain steps them down from captaincy first
+        (their old side is left open — assign a new captain with /capfor)."""
         if self.phase not in (Phase.PICKING, Phase.LIVE):
             return False, "No teams to move players between yet."
         where = where.upper()
@@ -391,16 +434,20 @@ class PugState:
             return False, "Target must be red, blu, or bench."
         if uid not in self.queue:
             return False, "That player isn't in this match."
-        if uid in self.capt_of.values():
-            return False, "That player is a captain — use /capoff first."
+        was_capt = None
+        for color, c in list(self.capt_of.items()):     # if a captain, free the slot
+            if c == uid:
+                was_capt = color
+                del self.capt_of[color]
         for c in ("RED", "BLU"):
             if uid in self.team[c]:
                 self.team[c].remove(uid)
+        note = f" (stepped down as {was_capt} captain)" if was_capt else ""
         if where == "BENCH":
-            return True, f"Moved <@{uid}> to the bench."
+            return True, f"Moved <@{uid}> to the bench{note}."
         if uid not in self.team[where]:
             self.team[where].append(uid)
-        return True, f"Moved <@{uid}> to {where}."
+        return True, f"Moved <@{uid}> to {where}{note}."
 
     # ---------- immunity admin ----------
     def immunity_list(self):
@@ -433,6 +480,15 @@ class PugState:
         return True, "Reset to queue."
 
     def admin_clear(self):
+        """Clear the queue. While a game is forming/live, the only thing that's
+        actually a 'queue' is the next queue, so clear ONLY that and leave the
+        current game alone (use /match report to end a game). With no game in
+        progress, clear the active queue as before."""
+        if self.slot_busy:
+            had = len(self.next_queue)
+            self.next_queue = {}
+            return True, (f"Next queue cleared ({had} removed). The current game is "
+                          "untouched — use /match report to end it.")
         self.reset_match()
         self.next_queue = {}
         return True, "Queue cleared."
@@ -599,12 +655,19 @@ if __name__ == "__main__":
     assert s.match_put(mover, "blu")[0] is True
     assert mover in s.team["BLU"] and mover not in s.team["RED"]
     assert len(s.team["RED"]) == n_red - 1 and len(s.team["BLU"]) == n_blu + 1
-    assert s.match_put(caps[0], "blu")[0] is False   # can't move a captain
+    # moving a captain now works: they step down and land on the target side
+    cap = caps[0]
+    cap_color = next(c for c, u in s.capt_of.items() if u == cap)
+    other = "BLU" if cap_color == "RED" else "RED"
+    assert s.match_put(cap, other.lower())[0] is True
+    assert cap not in s.capt_of.values()             # no longer a captain
+    assert cap in s.team[other]                       # placed on the target team
+    assert cap_color not in s.capt_of                 # old side left open
     # bench a player: removed from teams but still in the match (unpicked)
     assert s.match_put(mover, "bench")[0] is True
     assert mover not in s.team["RED"] and mover not in s.team["BLU"]
     assert mover in s.queue and mover in s.unpicked()
-    print("L) /match put moves players between teams and to the bench; captains protected")
+    print("L) /match put moves anyone incl. captains (who step down); bench works")
 
     # M) admin immunity management
     s = fresh()
@@ -648,5 +711,42 @@ if __name__ == "__main__":
     dropped = s.sweep_timeouts()
     assert 102 in dropped and 102 not in s.next_queue
     print("P) next-queue players can leave and time out")
+
+    # Q) state survives a to_dict -> JSON -> load_dict round trip (persistence)
+    import json as _json
+    clock["t"] = 7000.0
+    s = fresh(); fill(s, P); caps = drive_draft(s)            # LIVE, teams + immunity set
+    for x in range(101, 104):
+        s.add(x)                                              # 3 in the next queue
+    snap = _json.loads(_json.dumps(s.to_dict()))              # force JSON string keys
+    s2 = PugState(now=lambda: clock["t"])
+    s2.load_dict(snap)
+    assert s2.phase is s.phase
+    assert s2.queue_ids() == s.queue_ids()
+    assert s2.next_queue_ids() == s.next_queue_ids()
+    assert s2.team == s.team and s2.capt_of == s.capt_of
+    assert s2.immunity == s.immunity
+    assert s2.turn_idx == s.turn_idx and s2.picks_left == s.picks_left
+    ok, _, pinged = s2.match_report(caps[0])                  # restored captain can still report
+    assert ok and set(s2.queue) == {101, 102, 103}            # next queue promoted after reload
+    print("Q) full state round-trips through JSON and stays functional")
+
+    # R) /clear during a game wipes only the next queue, not the live match
+    clock["t"] = 9000.0
+    s = fresh(); fill(s, P); caps = drive_draft(s)           # LIVE
+    for x in (201, 202): s.add(x)                            # next queue
+    live_players = s.queue_ids()
+    ok, _ = s.admin_clear()
+    assert ok
+    assert s.phase is Phase.LIVE                              # game untouched
+    assert s.queue_ids() == live_players                      # same 12 still playing
+    assert s.next_queue_ids() == []                           # next queue wiped
+    # with no game running, /clear wipes the active queue as before
+    s.match_report(caps[0])                                   # ends game; next queue empty -> IDLE
+    s.add(301); s.add(302)
+    assert s.phase is Phase.QUEUING
+    s.admin_clear()
+    assert s.phase is Phase.IDLE and s.queue_ids() == []
+    print("R) /clear scopes to the next queue mid-game, full queue otherwise")
 
     print("\nall smoke tests passed.")
