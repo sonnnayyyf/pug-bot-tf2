@@ -46,6 +46,7 @@ class PugState:
         self._now = now
         self.immunity = {}            # uid -> med-immunity games left (spans games)
         self.auto_ready_until = {}    # uid -> epoch its auto-ready window ends
+        self.next_queue = {}          # uid -> joined_at; players waiting for the NEXT game
         self.reset_match()
 
     def reset_match(self):
@@ -63,6 +64,7 @@ class PugState:
     def reset_all(self):
         self.immunity = {}
         self.auto_ready_until = {}
+        self.next_queue = {}
         self.reset_match()
 
     # ---------- helpers ----------
@@ -86,17 +88,34 @@ class PugState:
     def queue_ids(self):
         return list(self.queue.keys())
 
+    def next_queue_ids(self):
+        return list(self.next_queue.keys())
+
+    @property
+    def slot_busy(self):
+        """True when a match is forming or live (so new joins wait for next)."""
+        return self.phase in (Phase.READY_CHECK, Phase.PICKING, Phase.LIVE)
+
     def unpicked(self):
         drafted = self._drafted()
         return [u for u in self.queue if u not in drafted]
 
     # ---------- queue + auto-ready ----------
     def add(self, uid, ar_seconds=DEFAULT_AR_SECONDS):
-        """Join (or re-arm auto-ready if already queued)."""
-        if self.phase not in (Phase.IDLE, Phase.QUEUING):
-            return False, "A game is in progress. Wait for it to finish."
+        """Join the active queue, or the next queue if a match is in progress.
+        Re-arms auto-ready if already queued."""
         ar_seconds = min(ar_seconds, MAX_AR_SECONDS)
         self.auto_ready_until[uid] = self._now() + ar_seconds
+        if self.slot_busy:
+            if uid in self.queue:
+                return False, "You're in the current game. /match report to end it first."
+            if uid in self.next_queue:
+                return True, f"Auto-ready extended. (next queue {len(self.next_queue)}/{QUEUE_SIZE})"
+            if len(self.next_queue) >= QUEUE_SIZE:
+                return False, "The next queue is full — wait for the current game to finish."
+            self.next_queue[uid] = self._now()
+            return True, f"next ({len(self.next_queue)}/{QUEUE_SIZE})"
+        # active slot free
         if uid in self.queue:
             return True, f"Auto-ready extended. ({len(self.queue)}/{QUEUE_SIZE})"
         self.phase = Phase.QUEUING
@@ -107,34 +126,42 @@ class PugState:
 
     def clear_auto_ready(self, uid):
         """Turn off a player's auto-confirm; they must ready up manually."""
-        if self.phase != Phase.QUEUING:
-            return False, "Only works while queuing."
-        if uid not in self.queue:
-            return False, "You're not in the queue."
-        self.auto_ready_until[uid] = 0
-        return True, "Auto-ready off — you'll need to ready up manually."
+        if uid in self.next_queue:
+            self.auto_ready_until[uid] = 0
+            return True, "Auto-ready off for the next game."
+        if self.phase == Phase.QUEUING and uid in self.queue:
+            self.auto_ready_until[uid] = 0
+            return True, "Auto-ready off — you'll need to ready up manually."
+        return False, "Only works while you're queuing."
 
     def remove(self, uid):
-        if self.phase != Phase.QUEUING:
-            return False, "Can only leave while queuing."
-        if uid not in self.queue:
-            return False, "You're not in the queue."
-        del self.queue[uid]
-        if not self.queue:
-            self.phase = Phase.IDLE
-        return True, "Left the queue."
+        if uid in self.next_queue:
+            del self.next_queue[uid]
+            return True, "Left the next queue."
+        if uid in self.queue:
+            if self.phase == Phase.QUEUING:
+                del self.queue[uid]
+                if not self.queue:
+                    self.phase = Phase.IDLE
+                return True, "Left the queue."
+            return False, "You're in the current game — /match report to end it, or /subme."
+        return False, "You're not in a queue."
 
     def sweep_timeouts(self):
-        """Idle-drop sweep (30 min). Background loop. QUEUING only."""
-        if self.phase != Phase.QUEUING:
-            return []
+        """Idle-drop sweep. Background loop. Sweeps the active queue (only while
+        QUEUING) and the next queue (any time). Returns dropped uids."""
         now, dropped = self._now(), []
-        for uid, joined in list(self.queue.items()):
+        if self.phase == Phase.QUEUING:
+            for uid, joined in list(self.queue.items()):
+                if now - joined >= TIMEOUT_SECONDS:
+                    del self.queue[uid]
+                    dropped.append(uid)
+            if not self.queue:
+                self.phase = Phase.IDLE
+        for uid, joined in list(self.next_queue.items()):
             if now - joined >= TIMEOUT_SECONDS:
-                del self.queue[uid]
+                del self.next_queue[uid]
                 dropped.append(uid)
-        if not self.queue:
-            self.phase = Phase.IDLE
         return dropped
 
     # ---------- ready check ----------
@@ -162,10 +189,22 @@ class PugState:
         not_ready = [u for u in self.queue if u not in self.ready]
         return ready, not_ready
 
+    def _merge_next_into_active(self):
+        """Fold the next queue into the active queue (used when a forming match
+        collapses). May re-trigger a ready check / draft if it now has 12."""
+        for uid, joined in self.next_queue.items():
+            if uid not in self.queue:
+                self.queue[uid] = joined
+        self.next_queue = {}
+        if len(self.queue) >= QUEUE_SIZE:
+            self._begin_ready_check()
+        else:
+            self.phase = Phase.QUEUING if self.queue else Phase.IDLE
+
     def abort_ready_check(self, uid):
-        """A participant bails during the ready check. ONLY they leave the
-        queue; everyone else stays. Since the queue is no longer full, we drop
-        back to QUEUING (a fresh check fires when it refills).
+        """A participant bails during the ready check. ONLY they leave; everyone
+        else stays. The queue is no longer full, so we fold in any next-queue
+        waiters and drop back to QUEUING (or re-fire a check if that hits 12).
         Returns (ok, msg, dropped)."""
         if self.phase != Phase.READY_CHECK:
             return False, "No ready check active.", []
@@ -174,10 +213,12 @@ class PugState:
         del self.queue[uid]
         self.ready = set()
         self.phase = Phase.QUEUING if self.queue else Phase.IDLE
+        self._merge_next_into_active()
         return True, "aborted", [uid]
 
     def resolve_ready_check(self):
-        """Called when the ready window expires. Drops the not-ready; returns them."""
+        """Called when the ready window expires. Drops the not-ready, then folds
+        in any next-queue waiters. Returns the dropped uids."""
         if self.phase != Phase.READY_CHECK:
             return []
         not_ready = [u for u in self.queue if u not in self.ready]
@@ -185,6 +226,7 @@ class PugState:
             del self.queue[u]
         self.ready = set()
         self.phase = Phase.QUEUING if self.queue else Phase.IDLE
+        self._merge_next_into_active()
         return not_ready
 
     # ---------- draft ----------
@@ -317,15 +359,27 @@ class PugState:
             if not is_admin and uid not in self.capt_of.values():
                 return False, "Only a captain or admin can report.", []
             players = list(self.queue.keys())
-            self.reset_match()
+            self._end_and_promote()
             return True, "Game reported. Queue open — /add to join.", players
         if self.phase in (Phase.READY_CHECK, Phase.PICKING):
             if not is_admin:
                 return False, "Only admins can cancel a forming match.", []
             players = list(self.queue.keys())
-            self.reset_match()
+            self._end_and_promote()
             return True, "your match has been canceled.", players
         return False, "No match to report.", []
+
+    def _end_and_promote(self):
+        """Clear the finished match and promote the next queue into the slot.
+        (Immunity was already applied at go-live; cancels apply none.)"""
+        self.reset_match()                  # clears active match; keeps next_queue/immunity
+        if self.next_queue:
+            self.queue = self.next_queue
+            self.next_queue = {}
+            if len(self.queue) >= QUEUE_SIZE:
+                self._begin_ready_check()   # promoted queue already full -> ready check
+            else:
+                self.phase = Phase.QUEUING
 
     def match_put(self, uid, where):
         """Admin: move a player onto a team, or to the bench (off all teams).
@@ -380,6 +434,7 @@ class PugState:
 
     def admin_clear(self):
         self.reset_match()
+        self.next_queue = {}
         return True, "Queue cleared."
 
 
@@ -558,5 +613,40 @@ if __name__ == "__main__":
     s.add_immunity(42, -5); assert 42 not in s.immunity     # clamps to 0 -> removed
     s.set_immunity(42, 2); s.clear_immunity(42); assert 42 not in s.immunity
     print("M) admin immunity set/add/clear works and clamps at 0")
+
+    # N) next queue: joins during a live game wait, then promote on report
+    clock["t"] = 1000.0
+    s = fresh(); fill(s, P); caps = drive_draft(s)
+    assert s.phase is Phase.LIVE
+    assert s.add(101)[0] is True and 101 in s.next_queue        # 13th -> next queue
+    assert s.add(102)[0] is True and 102 in s.next_queue
+    assert s.add(P[0])[0] is False                              # active player can't double-queue
+    assert len(s.queue) == 12 and len(s.next_queue) == 2
+    ok, msg, pinged = s.match_report(caps[0])                   # captain ends the game
+    assert ok and len(pinged) == 12
+    assert s.phase is Phase.QUEUING                             # next queue promoted
+    assert set(s.queue) == {101, 102} and not s.next_queue
+    print("N) next queue holds joins during a live game, promotes on report")
+
+    # O) promoted full next queue starts a ready check immediately
+    clock["t"] = 5000.0
+    s = fresh(); fill(s, P); caps = drive_draft(s)              # game LIVE, players 1..12
+    for x in range(101, 113):                                   # 12 fresh players -> next queue
+        s.add(x)
+    assert len(s.next_queue) == 12
+    ok, _, _ = s.match_report(caps[0])
+    assert s.phase in (Phase.READY_CHECK, Phase.PICKING)        # promoted full -> straight into it
+    assert set(s.queue) == set(range(101, 113))
+    print("O) a full next queue starts its ready check on promotion")
+
+    # P) leaving / sweeping the next queue
+    clock["t"] = 1000.0
+    s = fresh(); fill(s, P); drive_draft(s)
+    s.add(101); s.add(102)
+    assert s.remove(101)[0] is True and 101 not in s.next_queue
+    clock["t"] = 1000.0 + TIMEOUT_SECONDS + 1                   # idle out the next-queue player
+    dropped = s.sweep_timeouts()
+    assert 102 in dropped and 102 not in s.next_queue
+    print("P) next-queue players can leave and time out")
 
     print("\nall smoke tests passed.")
