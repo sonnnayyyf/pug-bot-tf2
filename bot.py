@@ -11,6 +11,7 @@ only where a ping is the point (the player on the clock, match cancellation).
 
 import os
 import time
+import json
 import asyncio
 import random
 import difflib
@@ -20,6 +21,8 @@ from typing import Optional
 import discord
 from discord import app_commands
 from discord.ext import tasks
+
+from storage import Store
 
 from pug_state import (PugState, Phase, QUEUE_SIZE,
                        DEFAULT_AR_SECONDS, AR_COMMAND_SECONDS,
@@ -52,6 +55,13 @@ SKILL_ROLES = [
     ("div 3", "Div 3"),
 ]
 
+# If set, the bot ONLY responds in this one channel; commands anywhere else are
+# ignored (text) or get a quiet "wrong channel" notice (slash). This stops people
+# queueing in random channels. Set it via the PUG_CHANNEL_ID env var — get the ID
+# from Discord with Developer Mode on: right-click the channel > Copy Channel ID.
+# Leave unset to allow the bot in every channel (old behaviour).
+PUG_CHANNEL_ID = int(os.environ["PUG_CHANNEL_ID"]) if os.environ.get("PUG_CHANNEL_ID") else None
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -60,6 +70,24 @@ pug = PugState()
 _last_channel = None
 _active_ready_view = None
 _last_promote = 0.0          # monotonic time of the last /promote ping
+
+# ---------- persistence ----------
+store = Store(os.environ.get("PUG_DB", "pug.db"))
+_last_saved = None           # last snapshot we wrote (skip redundant writes)
+_resume_channel_id = None    # channel to resume in, read from the snapshot on boot
+_resumed = False             # one-shot guard (on_ready can fire on reconnects)
+
+
+def persist():
+    """Write the current snapshot (state + the channel the game lives in) if it
+    changed. Cheap and called on a timer, so missing handlers is impossible."""
+    global _last_saved
+    payload = {"state": pug.to_dict(),
+               "channel_id": _last_channel.id if _last_channel else None,
+               "fake_names": FAKE_NAMES}
+    blob = json.dumps(payload, sort_keys=True)
+    if blob != _last_saved and store.save(payload):
+        _last_saved = blob
 
 
 # ---------- name + display helpers ----------
@@ -171,17 +199,25 @@ def ready_menu(guild) -> str:
             f"⌛ Waiting: {n}")
 
 
+def team_roster(guild, color) -> str:
+    """A team's bracketed roster line. The first slot is always the captain, so
+    'empty' in that slot means the team currently has no captain (e.g. after a
+    /match put moved one out). With no captain and no picks it reads '[ empty ]',
+    same as a fresh team at the start of the draft."""
+    capt = pug.capt_of.get(color)
+    picks = pug.team[color]
+    capt_str = player_tag(guild, capt) if capt else "empty"
+    inside = (" / ".join([capt_str] + [player_tag(guild, u) for u in picks])
+              if picks else capt_str)
+    return f"[ {inside} ]"
+
+
 def draft_embed(guild) -> discord.Embed:
     dot = {"RED": "🔴", "BLU": "🔵"}
     lines = []
     for color in ("RED", "BLU"):
-        capt = pug.capt_of.get(color)
-        members = ([capt] + pug.team[color]) if capt else pug.team[color]
         lines.append(f"{dot[color]} **{color}** ⟨{len(pug.team[color])}⟩")
-        if members:
-            lines.append("[ " + " / ".join(player_tag(guild, u) for u in members) + " ]")
-        else:
-            lines.append("[ empty ]")
+        lines.append(team_roster(guild, color))
     lines.append("")
     if not pug._both_capts_set:
         caps = " and ".join(player_tag(guild, u) for u in pug.captains)
@@ -202,7 +238,11 @@ def draft_embed(guild) -> discord.Embed:
         lines.append("Type **/capfor red** or **/capfor blu** to captain a team "
                      "(anyone may volunteer). **/capoff** to step down.")
     elif pug.phase is Phase.PICKING:
-        lines.append(f"{player_tag(guild, pug._current_picker())} to pick — /pick @player")
+        picker = pug._current_picker()
+        if picker:
+            lines.append(f"{player_tag(guild, picker)} to pick — /pick @player")
+        else:
+            lines.append("That side has no captain — /capfor red or /capfor blu to take it.")
     return discord.Embed(title="6v6 is now on the draft stage!",
                          description="\n".join(lines),
                          color=discord.Color.blurple())
@@ -212,9 +252,8 @@ def final_embed(guild) -> discord.Embed:
     dot = {"RED": "🔴", "BLU": "🔵"}
     lines = []
     for color in ("RED", "BLU"):
-        members = [pug.capt_of.get(color)] + pug.team[color]
         lines.append(f"{dot[color]} **{color}**")
-        lines.append("[ " + " / ".join(player_tag(guild, u) for u in members if u) + " ]")
+        lines.append(team_roster(guild, color))
     lines.append("—")
     lines.append("Admins: /match report to end or cancel.")
     return discord.Embed(title="Teams set — GLHF!",
@@ -317,12 +356,36 @@ async def announce_after_add(channel, guild, ar, confirm, reprint=True):
 
 
 # ---------- client ----------
+class PugTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # central choke point: every slash command flows through here, so this is
+        # where we enforce the single-channel lock and record the channel the game
+        # is happening in (used to resume in the right place after a restart).
+        # Text commands set the channel in on_message. Returning False blocks.
+        global _last_channel
+        if PUG_CHANNEL_ID is not None and interaction.channel_id != PUG_CHANNEL_ID:
+            await interaction.response.send_message(
+                f"PUGs only run in <#{PUG_CHANNEL_ID}> — use the bot there.", ephemeral=True)
+            return False
+        if interaction.channel is not None:
+            _last_channel = interaction.channel
+        return True
+
+
 class PugClient(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+        self.tree = PugTree(self)
 
     async def setup_hook(self):
+        global _resume_channel_id, _last_saved
+        # restore any persisted state before we start taking commands
+        saved = store.load()
+        if saved:
+            pug.load_dict(saved.get("state", {}))
+            _resume_channel_id = saved.get("channel_id")
+            FAKE_NAMES.update({int(k): v for k, v in (saved.get("fake_names") or {}).items()})
+            _last_saved = json.dumps(saved, sort_keys=True)
         gid = os.environ.get("TEST_GUILD_ID")
         if gid:
             guild = discord.Object(id=int(gid))
@@ -335,14 +398,60 @@ class PugClient(discord.Client):
             await self.tree.sync()
 
     async def on_ready(self):
+        global _resumed
         if not timeout_sweep.is_running():
             timeout_sweep.start()
+        if not autosave.is_running():
+            autosave.start()
+        if not _resumed:                 # on_ready can re-fire on reconnects
+            _resumed = True
+            await self._resume()
         print(f"Logged in as {self.user}")
+
+    async def _resume(self):
+        """After a restart, re-show (and for a ready check, re-arm) whatever game
+        was in progress, in the channel it was happening in."""
+        global _last_channel
+        if _resume_channel_id is None or pug.phase is Phase.IDLE:
+            return
+        channel = self.get_channel(_resume_channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(_resume_channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return
+        _last_channel = channel
+        guild = channel.guild
+        try:
+            if pug.phase is Phase.QUEUING and pug.queue_ids():
+                await channel.send("♻️ **Bot restarted** — queue restored.\n"
+                                   + queue_display(guild))
+            elif pug.phase is Phase.READY_CHECK:
+                await channel.send("♻️ **Bot restarted** — resuming the ready check "
+                                   "(fresh 2:00 window).")
+                await launch_ready_check(channel, guild)
+            elif pug.phase is Phase.PICKING:
+                await channel.send("♻️ **Bot restarted** — draft resumed.",
+                                   embed=draft_embed(guild))
+            elif pug.phase is Phase.LIVE:
+                await channel.send("♻️ **Bot restarted** — game still live.",
+                                   embed=final_embed(guild))
+            if pug.next_queue_ids() and pug.phase is not Phase.QUEUING:
+                await channel.send(next_queue_display(guild))
+        except discord.HTTPException:
+            pass
+
+    async def close(self):
+        persist()                        # final flush on graceful shutdown
+        store.close()
+        await super().close()
 
     async def on_message(self, message):
         global _last_channel
         if message.author.bot:
             return
+        if PUG_CHANNEL_ID is not None and message.channel.id != PUG_CHANNEL_ID:
+            return                       # ignore ++/--/!ar outside the PUG channel
         _last_channel = message.channel
         text = message.content.strip().lower()
         if text == "++":
@@ -716,6 +825,11 @@ async def timeout_sweep():
         names = ", ".join(f"<@{uid}>" for uid in dropped)   # real ping so they're notified
         hours = TIMEOUT_SECONDS // 3600
         await _last_channel.send(f"{names} were removed from all queues (idle {hours}h).")
+
+
+@tasks.loop(seconds=5)
+async def autosave():
+    persist()
 
 
 # ---------- debug harness (only registered when PUG_DEBUG=1) ----------
