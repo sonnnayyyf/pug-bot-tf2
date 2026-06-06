@@ -40,9 +40,7 @@ ADMIN_ROLE = "PUG Admin"
 
 # Role that /promote pings to rally players (matched case-insensitively against
 # the server's role names). Edit to match your server's role exactly.
-# TESTING: set to the manager role so we don't ping everyone while iterating.
-# >>> SWITCH BACK to "Puggers" when testing is done. <<<
-PUG_PING_ROLE = "Racist Pug Bot Manager"
+PUG_PING_ROLE = "Puggers"
 PROMOTE_COOLDOWN = 120          # seconds between /promote pings (anti-spam)
 
 # Skill-division roles shown next to unpicked players during the draft, so
