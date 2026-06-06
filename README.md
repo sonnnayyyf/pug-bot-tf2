@@ -15,7 +15,9 @@ Built with [discord.py](https://github.com/Rapptz/discord.py) (slash commands + 
 - **Snake-ish pick order** (`1-2-1-1-1-1-1-1-1`) that produces balanced 6v6 teams, with the captains as the two medics.
 - **Medic immunity** — whoever captains/medics a game gets immunity for their next **2** games (so they won't be forced to med again), tracked per-player, capped, and non-stacking.
 - **Substitutions** during the draft stage (`/subme` to request, `/subfor` to fill).
-- **Admin controls** — `/match report` (end a live game or cancel a forming one), `/reset` (re-roll a stuck draft), `/clear`, and `/forceadd` (rebuild a queue, e.g. after a restart).
+- **Next queue** — while a game is forming or live, new joins line up in a separate queue; when the active match is reported, that queue is promoted (and starts its own ready check if it's already full). One game forms/plays at a time, with the next lined up behind it.
+- **Persistence** — all state (queue, live match, immunity, auto-ready, next queue) is snapshotted to a local SQLite file (`pug.db`) and reloaded on boot, so a restart or crash resumes the active game instead of wiping it.
+- **Admin controls** — `/match report` (end a live game or cancel a forming one), `/match put` (move a player to a team or the bench), `/immunity` (manage med immunity), `/reset` (re-roll a stuck draft), `/clear`, and `/forceadd` (rebuild a queue, e.g. after a restart).
 - **Debug harness** (opt-in) for testing the full flow solo without 12 humans.
 
 ---
