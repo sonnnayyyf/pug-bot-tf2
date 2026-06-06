@@ -10,6 +10,7 @@ only where a ping is the point (the player on the clock, match cancellation).
 """
 
 import os
+import time
 import asyncio
 import random
 import difflib
@@ -34,6 +35,23 @@ except ImportError:
 
 ADMIN_ROLE = "PUG Admin"
 
+# Role that /promote pings to rally players (matched case-insensitively against
+# the server's role names). Edit to match your server's role exactly.
+# TESTING: set to the manager role so we don't ping everyone while iterating.
+# >>> SWITCH BACK to "Puggers" when testing is done. <<<
+PUG_PING_ROLE = "Racist Pug Bot Manager"
+PROMOTE_COOLDOWN = 120          # seconds between /promote pings (anti-spam)
+
+# Skill-division roles shown next to unpicked players during the draft, so
+# captains know who they're picking. Role names are matched case-insensitively
+# against each member's server roles; first match wins (so list best→worst).
+# Edit these to match your server's actual role names exactly.
+SKILL_ROLES = [
+    ("div 1", "Div 1"),
+    ("div 2", "Div 2"),
+    ("div 3", "Div 3"),
+]
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -41,6 +59,7 @@ intents.members = True
 pug = PugState()
 _last_channel = None
 _active_ready_view = None
+_last_promote = 0.0          # monotonic time of the last /promote ping
 
 
 # ---------- name + display helpers ----------
@@ -65,6 +84,19 @@ def player_tag(guild, uid) -> str:
     if uid in FAKE_NAMES:
         return f"`{FAKE_NAMES[uid]}`"
     return f"<@{uid}>"
+
+
+def skill_label(guild, uid) -> str:
+    """A player's skill-division tag (e.g. 'Div 1') from their server roles.
+    Returns '' for bots or members with no matching role."""
+    member = guild.get_member(uid) if guild else None
+    if not member:
+        return ""
+    have = {r.name.lower() for r in member.roles}
+    for key, label in SKILL_ROLES:
+        if key in have:
+            return label
+    return ""
 
 
 def fuzzy_unpicked(name, guild):
@@ -118,6 +150,14 @@ def queue_display(guild) -> str:
     return f"**6v6** ({len(ids)}/{QUEUE_SIZE}) | {roster}"
 
 
+def next_queue_display(guild) -> str:
+    ids = pug.next_queue_ids()
+    if not ids:
+        return "Next queue is empty."
+    roster = " / ".join(name_box(guild, u) for u in ids)
+    return f"**Next queue** ({len(ids)}/{QUEUE_SIZE}) | {roster}"
+
+
 def ready_menu(guild) -> str:
     # plain-text message (not an embed), so these mentions DO notify — that's
     # intended: the 12 get pinged once when the check starts. Editing the
@@ -151,8 +191,12 @@ def draft_embed(guild) -> discord.Embed:
     if up:
         lines.append("**Unpicked:**")
         for u in up:
+            tag = player_tag(guild, u)
+            skill = skill_label(guild, u)
             imm = pug.immunity.get(u)
-            lines.append(player_tag(guild, u) + (f" — **IMMUNE: x{imm}**" if imm else ""))
+            extra = f" · {skill}" if skill else ""
+            extra += f" — **IMMUNE: x{imm}**" if imm else ""
+            lines.append(tag + extra)
     lines.append("—")
     if not pug._both_capts_set:
         lines.append("Type **/capfor red** or **/capfor blu** to captain a team "
@@ -204,7 +248,7 @@ class ReadyView(discord.ui.View):
         await self.message.edit(
             content=f"**Ready check failed.** Dropped (expire time ran off): {names}",
             view=None)
-        await self.channel.send(queue_display(self.guild))
+        await render_active(self.channel, self.guild)
 
     @discord.ui.button(label="Ready", style=discord.ButtonStyle.success, emoji="✅")
     async def ready_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -234,13 +278,26 @@ class ReadyView(discord.ui.View):
             content=f"**Ready check aborted** — {name_box(self.guild, interaction.user.id)} "
                     "left the queue.",
             view=None)
-        await self.channel.send(queue_display(self.guild))
+        await render_active(self.channel, self.guild)
 
 
 async def launch_ready_check(channel, guild):
     global _active_ready_view
     _active_ready_view = ReadyView(channel, guild)
     await _active_ready_view.start()
+
+
+async def render_active(channel, guild):
+    """Show whatever the active slot is now (used after state changes that may
+    promote the next queue or re-fire a ready check)."""
+    if pug.phase is Phase.READY_CHECK:
+        await launch_ready_check(channel, guild)
+    elif pug.phase is Phase.PICKING:
+        await channel.send(embed=draft_embed(guild))
+    elif pug.phase is Phase.LIVE:
+        await channel.send(embed=final_embed(guild))
+    else:
+        await channel.send(queue_display(guild))
 
 
 async def announce_after_add(channel, guild, ar, confirm, reprint=True):
@@ -297,15 +354,22 @@ class PugClient(discord.Client):
             await message.channel.send(queue_display(message.guild) if ok else msg)
 
     async def _text_add(self, message, ar):
-        was_queued = message.author.id in pug.queue
-        ok, msg = pug.add(message.author.id, ar)
+        uid = message.author.id
+        busy = pug.slot_busy
+        already = uid in pug.queue or uid in pug.next_queue
+        ok, msg = pug.add(uid, ar)
         if not ok:
             await message.channel.send(msg)
             return
         async def confirm(content=None, embed=None):
             await message.channel.send(content=content, embed=embed)
-        await announce_after_add(message.channel, message.guild, ar, confirm,
-                                 reprint=not was_queued)
+        if busy:                                  # joined / re-armed the next queue
+            await confirm(embed=success_embed(ar))
+            if not already:
+                await message.channel.send(next_queue_display(message.guild))
+        else:
+            await announce_after_add(message.channel, message.guild, ar, confirm,
+                                     reprint=not already)
 
 
 client = PugClient()
@@ -315,15 +379,22 @@ client = PugClient()
 async def _slash_add(interaction: discord.Interaction, ar: int):
     global _last_channel
     _last_channel = interaction.channel
-    was_queued = interaction.user.id in pug.queue
-    ok, msg = pug.add(interaction.user.id, ar)
+    uid = interaction.user.id
+    busy = pug.slot_busy
+    already = uid in pug.queue or uid in pug.next_queue
+    ok, msg = pug.add(uid, ar)
     if not ok:
         await interaction.response.send_message(msg, ephemeral=True)
         return
     async def confirm(content=None, embed=None):
         await interaction.response.send_message(content=content, embed=embed)
-    await announce_after_add(interaction.channel, interaction.guild, ar, confirm,
-                             reprint=not was_queued)
+    if busy:                                  # joined / re-armed the next queue
+        await confirm(embed=success_embed(ar))
+        if not already:
+            await interaction.channel.send(next_queue_display(interaction.guild))
+    else:
+        await announce_after_add(interaction.channel, interaction.guild, ar, confirm,
+                                 reprint=not already)
 
 
 @client.tree.command(name="add", description="Join the queue (2-min auto-ready).")
@@ -437,6 +508,9 @@ async def match_report_cmd(interaction: discord.Interaction):
         return
     mentions = ", ".join(f"<@{u}>" for u in pinged)   # cancellation SHOULD ping
     await interaction.response.send_message(f"{mentions} {msg}" if mentions else msg)
+    # a next queue may have just been promoted into the active slot
+    if pug.queue_ids():
+        await render_active(interaction.channel, interaction.guild)
 
 
 @match_group.command(name="put", description="Admin: move a player onto a team, or bench them.")
@@ -487,14 +561,18 @@ async def forceadd_cmd(interaction: discord.Interaction, players: str):
         await interaction.response.send_message(
             "Mention at least one player, e.g. /forceadd players:@a @b", ephemeral=True)
         return
+    busy = pug.slot_busy
     added = []
     for uid in ids:
         ok, _ = pug.add(uid)                       # default 2-min auto-ready
         if ok:
             added.append(uid)
-        if pug.phase not in (Phase.IDLE, Phase.QUEUING):   # queue filled -> stop
-            break
-    if pug.phase is Phase.READY_CHECK:
+        if not busy and pug.phase not in (Phase.IDLE, Phase.QUEUING):
+            break                                  # active queue just filled
+    if busy:                                        # slot occupied -> went to next queue
+        await interaction.response.send_message(
+            f"Added {len(added)} to the next queue.\n{next_queue_display(interaction.guild)}")
+    elif pug.phase is Phase.READY_CHECK:
         await interaction.response.send_message(f"Added {len(added)} — queue full, ready check:")
         await launch_ready_check(interaction.channel, interaction.guild)
     elif pug.phase is Phase.PICKING:
@@ -560,15 +638,49 @@ async def clear_cmd(interaction: discord.Interaction):
 
 
 # ---------- slash: info ----------
+@client.tree.command(name="tosscoin", description="Flip a coin — heads or tails.")
+async def tosscoin_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message(f"🪙 **{random.choice(('Heads', 'Tails'))}**")
+
+
+@client.tree.command(name="promote", description="Ping the pugger role with how many more players are needed.")
+async def promote_cmd(interaction: discord.Interaction):
+    global _last_promote
+    if pug.slot_busy:
+        await interaction.response.send_message(
+            "A game is already forming or live — nothing to promote.", ephemeral=True)
+        return
+    needed = QUEUE_SIZE - len(pug.queue_ids())
+    if needed <= 0:
+        await interaction.response.send_message("The queue is already full.", ephemeral=True)
+        return
+    remaining = PROMOTE_COOLDOWN - (time.monotonic() - _last_promote)
+    if remaining > 0:
+        await interaction.response.send_message(
+            f"`/promote` is on cooldown — try again in {int(remaining) + 1}s.", ephemeral=True)
+        return
+    _last_promote = time.monotonic()
+    role = discord.utils.find(
+        lambda r: r.name.lower() == PUG_PING_ROLE.lower(), interaction.guild.roles)
+    mention = role.mention if role else f"@{PUG_PING_ROLE}"
+    await interaction.response.send_message(
+        f"{mention} There are **{needed}** more player(s) required to start the 6v6 pug. "
+        "Type `/add` or `++` to join!",
+        allowed_mentions=discord.AllowedMentions(roles=True))
+
+
 @client.tree.command(name="queue", description="Show the queue, or teams if a game is on.")
 async def queue_cmd(interaction: discord.Interaction):
     g = interaction.guild
+    nxt = f"\n\n{next_queue_display(g)}" if pug.next_queue_ids() else ""
     if pug.phase is Phase.PICKING:
-        await interaction.response.send_message(embed=draft_embed(g))
+        await interaction.response.send_message(embed=draft_embed(g),
+                                                content=(next_queue_display(g) if nxt else None))
     elif pug.phase is Phase.LIVE:
-        await interaction.response.send_message(embed=final_embed(g))
+        await interaction.response.send_message(embed=final_embed(g),
+                                                content=(next_queue_display(g) if nxt else None))
     else:
-        await interaction.response.send_message(queue_display(g))
+        await interaction.response.send_message(queue_display(g) + nxt)
 
 
 @client.tree.command(name="commands", description="Show the command list.")
@@ -582,13 +694,16 @@ async def commands_cmd(interaction: discord.Interaction):
         "`/aroff` — turn off your auto-ready\n"
         "`/ready` — confirm in a ready check (or click the button)\n"
         "`/queue` — show queue or teams\n"
+        "`/promote` — ping the pugger role for more players\n"
+        "`/tosscoin` — flip a coin (heads/tails)\n"
         "`/capfor red|blu` — volunteer to captain · `/capoff` — step down\n"
         "`/pick @user` — draft a player\n"
         "`/subme` — request a sub · `/subfor` — sub in (draft stage)\n"
         "`/match report` — end/cancel a match\n"
         "`/match put @player red|blu|bench` — admin: move a player to a team or bench\n"
         "`/immunity show|set|add|clear` — admin: manage med immunity\n"
-        "`/reset` · `/clear` · `/forceadd` — admin"
+        "`/reset` · `/clear` · `/forceadd` — admin\n"
+        "\n*While a game is live, new joins line up in the **next queue** and start once it's reported.*"
     )
     await interaction.response.send_message(text, ephemeral=True)
 
