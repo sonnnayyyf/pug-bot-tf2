@@ -241,12 +241,20 @@ class PugState:
         return ready, not_ready
 
     def _merge_next_into_active(self):
-        """Fold the next queue into the active queue (used when a forming match
-        collapses). May re-trigger a ready check / draft if it now has 12."""
-        for uid, joined in self.next_queue.items():
-            if uid not in self.queue:
-                self.queue[uid] = joined
-        self.next_queue = {}
+        """Fold next-queue waiters into the active queue when a forming match
+        collapses, but NEVER past QUEUE_SIZE. Promotes oldest-joined first; any
+        overflow stays in the next queue. May re-trigger a ready check / draft
+        if the active queue now has 12."""
+        slots = QUEUE_SIZE - len(self.queue)
+        for uid, joined in sorted(self.next_queue.items(), key=lambda kv: kv[1]):
+            if slots <= 0:
+                break
+            if uid in self.queue:
+                del self.next_queue[uid]          # dedupe; doesn't consume a slot
+                continue
+            self.queue[uid] = joined
+            del self.next_queue[uid]
+            slots -= 1
         if len(self.queue) >= QUEUE_SIZE:
             self._begin_ready_check()
         else:
@@ -834,5 +842,30 @@ if __name__ == "__main__":
     assert s.live_since is None                             # clock reset
     assert s.check_live_timeout() is None                   # idempotent (no longer LIVE)
     print("U) live games auto-report after the time limit and promote the next queue")
+
+    # V) failed ready check never overflows the active queue past 12.
+    #    12 queued + 6 waiting in next queue; 2 fail to ready. The 2 are dropped,
+    #    exactly 2 are pulled from the next queue to refill to 12, and the others
+    #    stay waiting — the draft must NOT start with 16.
+    clock["t"] = 1000.0
+    s = fresh()
+    s.add(1); s.clear_auto_ready(1)            # two players who won't auto-confirm
+    s.add(2); s.clear_auto_ready(2)
+    for b in range(3, 13):                      # 10 more -> queue is full (12), check fires
+        s.add(b)
+    assert s.phase is Phase.READY_CHECK and len(s.queue) == 12
+    for x in range(101, 107):                   # 6 waiters land in the next queue
+        clock["t"] = 1000.0 + (x - 100)         # staggered joins so order is well-defined
+        s.add(x)
+    assert len(s.next_queue) == 6
+    s.mark_ready(2)                             # only player 1 stays unready
+    dropped = s.resolve_ready_check()           # window expires
+    assert dropped == [1], dropped
+    assert len(s.queue) == 12, len(s.queue)     # refilled to exactly 12, NOT 16
+    assert len(s.next_queue) == 5               # 1 promoted to backfill, 5 still waiting
+    assert 101 in s.queue                       # oldest waiter promoted first
+    assert {102, 103, 104, 105, 106} == set(s.next_queue)
+    assert s.phase in (Phase.READY_CHECK, Phase.PICKING)  # a fresh check on the 12
+    print("V) failed ready check refills to 12 and never overflows the queue")
 
     print("\nall smoke tests passed.")
