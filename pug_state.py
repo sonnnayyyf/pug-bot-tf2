@@ -43,9 +43,12 @@ PICK_ORDER = [
 
 
 class PugState:
-    def __init__(self, now=time.time):
+    def __init__(self, now=time.time, immunity=None):
         self._now = now
-        self.immunity = {}            # uid -> med-immunity games left (spans games)
+        # immunity may be a dict shared across several PugStates (multi-lobby:
+        # immunity is a property of the player, not the channel). We only ever
+        # mutate it in place so the shared reference stays intact.
+        self.immunity = immunity if immunity is not None else {}
         self.auto_ready_until = {}    # uid -> epoch its auto-ready window ends
         self.next_queue = {}          # uid -> joined_at; players waiting for the NEXT game
         self.reset_match()
@@ -64,7 +67,7 @@ class PugState:
         self.live_since = None        # epoch the game went LIVE (for auto-report)
 
     def reset_all(self):
-        self.immunity = {}
+        self.immunity.clear()
         self.auto_ready_until = {}
         self.next_queue = {}
         self.reset_match()
@@ -108,7 +111,8 @@ class PugState:
         self.turn_idx = int(d.get("turn_idx", 0))
         self.picks_left = int(d.get("picks_left", 0))
         self.sub_requests = [int(u) for u in d.get("sub_requests", [])]
-        self.immunity = ints(d.get("immunity"))
+        self.immunity.clear()
+        self.immunity.update(ints(d.get("immunity")))
         self.auto_ready_until = ints(d.get("auto_ready_until"))
         self.next_queue = ints(d.get("next_queue"))
         self.live_since = d.get("live_since")
