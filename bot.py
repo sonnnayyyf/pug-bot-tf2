@@ -59,7 +59,24 @@ SKILL_ROLES = [
 # queueing in random channels. Set it via the PUG_CHANNEL_ID env var — get the ID
 # from Discord with Developer Mode on: right-click the channel > Copy Channel ID.
 # Leave unset to allow the bot in every channel (old behaviour).
-PUG_CHANNEL_ID = int(os.environ["PUG_CHANNEL_ID"]) if os.environ.get("PUG_CHANNEL_ID") else None
+# PUGs run in these channels. Each listed channel is an INDEPENDENT lobby with
+# its own queue / ready check / draft / live game. Set PUG_CHANNEL_ID (or the
+# alias PUG_CHANNEL_IDS) to a comma- or space-separated list of channel IDs, e.g.
+# PUG_CHANNEL_ID="111111111111 222222222222". One ID = single lobby (old
+# behaviour). Unset = a single lobby that responds in every channel.
+# Get IDs with Developer Mode on: right-click a channel > Copy Channel ID.
+def _parse_channel_ids(raw):
+    out = []
+    for part in re.split(r"[,\s]+", (raw or "").strip()):
+        if part:
+            try:
+                out.append(int(part))
+            except ValueError:
+                pass
+    return out
+
+PUG_CHANNEL_IDS = _parse_channel_ids(
+    os.environ.get("PUG_CHANNEL_ID") or os.environ.get("PUG_CHANNEL_IDS") or "")
 
 # Channel where players post/find the server connect string. Shown on the live
 # teams embed so people know where to go. Set CONNECT_CHANNEL_ID (channel ID) to
@@ -70,25 +87,133 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-pug = PugState()
-_last_channel = None
-_active_ready_view = None
-_last_promote = 0.0          # monotonic time of the last /promote ping
+import contextvars
+from lobby import reconcile, blocking_cid
+
+# ---------- lobby registry (one independent game per configured channel) ----------
+SHARED_IMMUNITY = {}             # med immunity is shared across lobbies (per-player)
+_SINGLE = None                   # lobby key used when no channels are configured
+lobbies = {}                     # lobby_key -> PugState
+_ready_views = {}                # lobby_key -> ReadyView | None
+_lobby_channels = {}             # lobby_key -> discord channel (for posting / resume)
+_resume_keys = {}                # lobby_key -> channel_id to resume in (from snapshot)
+_last_promote = {}               # lobby_key -> monotonic time of last /promote ping
+
+
+def _new_state():
+    return PugState(immunity=SHARED_IMMUNITY)
+
+
+# Pre-create the configured lobbies (or a single shared one if none configured).
+if PUG_CHANNEL_IDS:
+    for _cid in PUG_CHANNEL_IDS:
+        lobbies[_cid] = _new_state()
+else:
+    lobbies[_SINGLE] = _new_state()
+
+_cur_key = contextvars.ContextVar("cur_lobby_key", default=_SINGLE)
+
+
+def lobby_key_for(channel_id):
+    """Channel id -> its lobby key, or False if it isn't a PUG channel."""
+    if PUG_CHANNEL_IDS:
+        return channel_id if channel_id in PUG_CHANNEL_IDS else False
+    return _SINGLE                # single shared lobby, responds in any channel
+
+
+def _enter(channel):
+    """Bind the active lobby for this task from a channel. Returns its PugState,
+    or None if the channel isn't a PUG channel."""
+    key = lobby_key_for(channel.id)
+    if key is False:
+        return None
+    _cur_key.set(key)
+    _lobby_channels[key] = channel
+    return lobbies[key]
+
+
+class _LobbyProxy:
+    """Forwards attribute access to the current task's lobby PugState, so every
+    existing `pug.…` call site operates on the right channel's game without
+    threading a state parameter through dozens of helpers. Async-safe: the key
+    lives in a ContextVar, so concurrent interactions in different channels never
+    clobber each other."""
+    __slots__ = ()
+
+    def __getattr__(self, name):
+        return getattr(lobbies[_cur_key.get()], name)
+
+
+pug = _LobbyProxy()
+
+
+def cross_block_msg(uid):
+    """If `uid` is committed to a game in a DIFFERENT lobby, return a refusal
+    message (they can't queue anywhere until that game ends). Else None."""
+    if len(lobbies) < 2:
+        return None
+    home = blocking_cid(lobbies, uid, _cur_key.get())
+    if home is None:
+        return None
+    ch = _lobby_channels.get(home)
+    where = ch.mention if ch is not None else "another channel"
+    return f"You're in the game in {where} — finish it before queuing here."
+
+
+async def after_commit(home_channel, home_guild):
+    """Enforce one-game-at-a-time after any change that may commit a player:
+    pull committed players out of every OTHER lobby, notify those channels, and
+    re-render them (a mid-check pull backfills and may re-fire that check)."""
+    if len(lobbies) < 2:
+        return
+    changed, _notes = reconcile(lobbies)
+    for key, uids in changed.items():
+        ch = _lobby_channels.get(key)
+        if ch is None:
+            continue
+        old = _ready_views.get(key)          # tear down a now-stale ready check
+        if old is not None:
+            if old.deadline:
+                old.deadline.cancel()
+            old.stop()
+            _ready_views[key] = None
+            try:
+                await old.message.edit(content="*(queue changed — re-checking)*", view=None)
+            except (discord.HTTPException, AttributeError):
+                pass
+        token = _cur_key.set(key)
+        try:
+            names = ", ".join(name_box(ch.guild, u) for u in uids)
+            await ch.send(f"{names} got pulled into a game in another channel — "
+                          "removed from this queue.")
+            await render_active(ch, ch.guild)
+        finally:
+            _cur_key.reset(token)
 
 # ---------- persistence ----------
 store = Store(os.environ.get("PUG_DB", "pug.db"))
 _last_saved = None           # last snapshot we wrote (skip redundant writes)
-_resume_channel_id = None    # channel to resume in, read from the snapshot on boot
 _resumed = False             # one-shot guard (on_ready can fire on reconnects)
 
 
 def persist():
-    """Write the current snapshot (state + the channel the game lives in) if it
-    changed. Cheap and called on a timer, so missing handlers is impossible."""
+    """Write a snapshot of every lobby (+ shared immunity + the channel each game
+    lives in) if it changed. Cheap and called on a timer, so a missed handler
+    can never lose much."""
     global _last_saved
-    payload = {"state": pug.to_dict(),
-               "channel_id": _last_channel.id if _last_channel else None,
-               "fake_names": FAKE_NAMES}
+    payload = {
+        "v": 2,
+        "immunity": SHARED_IMMUNITY,
+        "fake_names": FAKE_NAMES,
+        "lobbies": {
+            str(key): {
+                "state": st.to_dict(),
+                "channel_id": (_lobby_channels[key].id
+                               if _lobby_channels.get(key) is not None else None),
+            }
+            for key, st in lobbies.items()
+        },
+    }
     blob = json.dumps(payload, sort_keys=True)
     if blob != _last_saved and store.save(payload):
         _last_saved = blob
@@ -269,12 +394,18 @@ def final_embed(guild) -> discord.Embed:
 
 # ---------- ready-check UI ----------
 class ReadyView(discord.ui.View):
-    def __init__(self, channel, guild):
-        super().__init__(timeout=None)   # we run our own hard 60s deadline
+    def __init__(self, channel, guild, key=_SINGLE):
+        super().__init__(timeout=None)   # we run our own hard ready deadline
         self.channel = channel
         self.guild = guild
+        self.key = key                   # which lobby this check belongs to
         self.message = None
         self.deadline = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # button clicks don't flow through the command tree, so bind the lobby here
+        _cur_key.set(self.key)
+        return True
 
     async def start(self):
         self.message = await self.channel.send(ready_menu(self.guild), view=self)
@@ -293,6 +424,7 @@ class ReadyView(discord.ui.View):
         if self.deadline:
             self.deadline.cancel()
         self.stop()
+        _ready_views[self.key] = None
         if self.message:
             try:
                 await self.message.edit(content="**All players ready!**", view=None)
@@ -301,6 +433,7 @@ class ReadyView(discord.ui.View):
         await self.channel.send(embed=draft_embed(self.guild))
 
     async def _expire(self):
+        _cur_key.set(self.key)
         try:
             await asyncio.sleep(READY_CHECK_SECONDS)
         except asyncio.CancelledError:
@@ -309,11 +442,13 @@ class ReadyView(discord.ui.View):
             return
         dropped = pug.resolve_ready_check()
         self.stop()
+        _ready_views[self.key] = None
         names = " / ".join(name_box(self.guild, u) for u in dropped) or "nobody"
         await self.message.edit(
             content=f"**Ready check failed.** Dropped (expire time ran off): {names}",
             view=None)
         await render_active(self.channel, self.guild)
+        await after_commit(self.channel, self.guild)
 
     @discord.ui.button(label="Ready", style=discord.ButtonStyle.success, emoji="✅")
     async def ready_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -325,10 +460,12 @@ class ReadyView(discord.ui.View):
             if self.deadline:
                 self.deadline.cancel()
             self.stop()
+            _ready_views[self.key] = None
             await interaction.response.edit_message(content="**All players ready!**", view=None)
             await self.channel.send(embed=draft_embed(self.guild))
         else:
             await interaction.response.edit_message(content=ready_menu(self.guild), view=self)
+        await after_commit(self.channel, self.guild)
 
     @discord.ui.button(label="Abort", style=discord.ButtonStyle.danger, emoji="✖️")
     async def abort_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -339,17 +476,20 @@ class ReadyView(discord.ui.View):
         if self.deadline:
             self.deadline.cancel()
         self.stop()
+        _ready_views[self.key] = None
         await interaction.response.edit_message(
             content=f"**Ready check aborted** — {name_box(self.guild, interaction.user.id)} "
                     "left the queue.",
             view=None)
         await render_active(self.channel, self.guild)
+        await after_commit(self.channel, self.guild)
 
 
 async def launch_ready_check(channel, guild):
-    global _active_ready_view
-    _active_ready_view = ReadyView(channel, guild)
-    await _active_ready_view.start()
+    key = _cur_key.get()
+    view = ReadyView(channel, guild, key)
+    _ready_views[key] = view
+    await view.start()
 
 
 async def render_active(channel, guild):
@@ -385,16 +525,17 @@ async def announce_after_add(channel, guild, ar, confirm, reprint=True):
 class PugTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         # central choke point: every slash command flows through here, so this is
-        # where we enforce the single-channel lock and record the channel the game
-        # is happening in (used to resume in the right place after a restart).
-        # Text commands set the channel in on_message. Returning False blocks.
-        global _last_channel
-        if PUG_CHANNEL_ID is not None and interaction.channel_id != PUG_CHANNEL_ID:
+        # where we bind the lobby for this channel (so `pug` resolves correctly)
+        # and enforce the channel lock. Text commands bind in on_message.
+        key = lobby_key_for(interaction.channel_id) if interaction.channel_id else False
+        if key is False:
+            where = " ".join(f"<#{c}>" for c in PUG_CHANNEL_IDS) or "the PUG channel"
             await interaction.response.send_message(
-                f"PUGs only run in <#{PUG_CHANNEL_ID}> — use the bot there.", ephemeral=True)
+                f"PUGs only run in {where} — use the bot there.", ephemeral=True)
             return False
+        _cur_key.set(key)
         if interaction.channel is not None:
-            _last_channel = interaction.channel
+            _lobby_channels[key] = interaction.channel
         return True
 
 
@@ -404,12 +545,21 @@ class PugClient(discord.Client):
         self.tree = PugTree(self)
 
     async def setup_hook(self):
-        global _resume_channel_id, _last_saved
+        global _last_saved
         # restore any persisted state before we start taking commands
         saved = store.load()
-        if saved:
-            pug.load_dict(saved.get("state", {}))
-            _resume_channel_id = saved.get("channel_id")
+        if saved and saved.get("lobbies"):
+            SHARED_IMMUNITY.clear()
+            SHARED_IMMUNITY.update(
+                {int(k): int(v) for k, v in (saved.get("immunity") or {}).items()})
+            for k_str, lob in saved["lobbies"].items():
+                key = _SINGLE if k_str == "None" else int(k_str)
+                if key not in lobbies:
+                    continue                       # config changed; ignore unknown lobby
+                lobbies[key].load_dict(lob.get("state", {}))
+                cid = lob.get("channel_id")
+                if cid is not None:
+                    _resume_keys[key] = cid
             FAKE_NAMES.update({int(k): v for k, v in (saved.get("fake_names") or {}).items()})
             _last_saved = json.dumps(saved, sort_keys=True)
         gid = os.environ.get("TEST_GUILD_ID")
@@ -436,36 +586,38 @@ class PugClient(discord.Client):
 
     async def _resume(self):
         """After a restart, re-show (and for a ready check, re-arm) whatever game
-        was in progress, in the channel it was happening in."""
-        global _last_channel
-        if _resume_channel_id is None or pug.phase is Phase.IDLE:
-            return
-        channel = self.get_channel(_resume_channel_id)
-        if channel is None:
+        was in progress in each lobby, in the channel it was happening in."""
+        for key, cid in list(_resume_keys.items()):
+            st = lobbies.get(key)
+            if st is None or st.phase is Phase.IDLE:
+                continue
+            channel = self.get_channel(cid)
+            if channel is None:
+                try:
+                    channel = await self.fetch_channel(cid)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    continue
+            _lobby_channels[key] = channel
+            _cur_key.set(key)
+            guild = channel.guild
             try:
-                channel = await self.fetch_channel(_resume_channel_id)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                return
-        _last_channel = channel
-        guild = channel.guild
-        try:
-            if pug.phase is Phase.QUEUING and pug.queue_ids():
-                await channel.send("♻️ **Bot restarted** — queue restored.\n"
-                                   + queue_display(guild))
-            elif pug.phase is Phase.READY_CHECK:
-                await channel.send("♻️ **Bot restarted** — resuming the ready check "
-                                   "(fresh 2:00 window).")
-                await launch_ready_check(channel, guild)
-            elif pug.phase is Phase.PICKING:
-                await channel.send("♻️ **Bot restarted** — draft resumed.",
-                                   embed=draft_embed(guild))
-            elif pug.phase is Phase.LIVE:
-                await channel.send("♻️ **Bot restarted** — game still live.",
-                                   embed=final_embed(guild))
-            if pug.next_queue_ids() and pug.phase is not Phase.QUEUING:
-                await channel.send(next_queue_display(guild))
-        except discord.HTTPException:
-            pass
+                if pug.phase is Phase.QUEUING and pug.queue_ids():
+                    await channel.send("♻️ **Bot restarted** — queue restored.\n"
+                                       + queue_display(guild))
+                elif pug.phase is Phase.READY_CHECK:
+                    await channel.send("♻️ **Bot restarted** — resuming the ready check "
+                                       "(fresh 2:00 window).")
+                    await launch_ready_check(channel, guild)
+                elif pug.phase is Phase.PICKING:
+                    await channel.send("♻️ **Bot restarted** — draft resumed.",
+                                       embed=draft_embed(guild))
+                elif pug.phase is Phase.LIVE:
+                    await channel.send("♻️ **Bot restarted** — game still live.",
+                                       embed=final_embed(guild))
+                if pug.next_queue_ids() and pug.phase is not Phase.QUEUING:
+                    await channel.send(next_queue_display(guild))
+            except discord.HTTPException:
+                pass
 
     async def close(self):
         persist()                        # final flush on graceful shutdown
@@ -473,17 +625,18 @@ class PugClient(discord.Client):
         await super().close()
 
     async def on_message(self, message):
-        global _last_channel
         if message.author.bot:
             return
-        if PUG_CHANNEL_ID is not None and message.channel.id != PUG_CHANNEL_ID:
-            return                       # ignore ++/--/!ar outside the PUG channel
-        _last_channel = message.channel
+        if _enter(message.channel) is None:
+            return                       # ignore ++/--/!ar outside a PUG channel
         text = message.content.strip().lower()
-        if text == "++":
-            await self._text_add(message, DEFAULT_AR_SECONDS)
-        elif text == "!ar":
-            await self._text_add(message, AR_COMMAND_SECONDS)
+        if text in ("++", "!ar"):
+            uid = message.author.id
+            blocked = cross_block_msg(uid)
+            if blocked and not (pug.phase is Phase.READY_CHECK and uid in pug.queue):
+                await message.channel.send(blocked)
+                return
+            await self._text_add(message, DEFAULT_AR_SECONDS if text == "++" else AR_COMMAND_SECONDS)
         elif text == "--":
             ok, msg = pug.remove(message.author.id)
             if not ok:
@@ -505,6 +658,7 @@ class PugClient(discord.Client):
         if in_check:                              # armed auto-ready mid ready-check
             await self._after_ready_arm(message.channel, message.guild, ar,
                                         lambda **k: message.channel.send(**k))
+            await after_commit(message.channel, message.guild)
             return
         async def confirm(content=None, embed=None):
             await message.channel.send(content=content, embed=embed)
@@ -515,12 +669,13 @@ class PugClient(discord.Client):
         else:
             await announce_after_add(message.channel, message.guild, ar, confirm,
                                      reprint=not already)
+        await after_commit(message.channel, message.guild)
 
     async def _after_ready_arm(self, channel, guild, ar, reply):
         """Shared rendering after a player arms auto-ready during a ready check:
         they're confirmed now; if that completed the check, launch the draft,
         otherwise refresh the ready menu so they show as ready."""
-        view = _active_ready_view
+        view = _ready_views.get(_cur_key.get())
         if pug.phase is Phase.PICKING:            # they were the last needed
             if view:
                 await view.finish_draft()
@@ -539,10 +694,12 @@ client = PugClient()
 
 # ---------- slash: joining ----------
 async def _slash_add(interaction: discord.Interaction, ar: int):
-    global _last_channel
-    _last_channel = interaction.channel
     uid = interaction.user.id
     in_check = pug.phase is Phase.READY_CHECK and uid in pug.queue
+    blocked = cross_block_msg(uid)
+    if blocked and not in_check:
+        await interaction.response.send_message(blocked, ephemeral=True)
+        return
     busy = pug.slot_busy
     already = uid in pug.queue or uid in pug.next_queue
     ok, msg = pug.add(uid, ar)
@@ -555,6 +712,7 @@ async def _slash_add(interaction: discord.Interaction, ar: int):
             replied["v"] = True
             await interaction.response.send_message(content, ephemeral=True)
         await client._after_ready_arm(interaction.channel, interaction.guild, ar, reply)
+        await after_commit(interaction.channel, interaction.guild)
         return
     async def confirm(content=None, embed=None):
         await interaction.response.send_message(content=content, embed=embed)
@@ -565,6 +723,7 @@ async def _slash_add(interaction: discord.Interaction, ar: int):
     else:
         await announce_after_add(interaction.channel, interaction.guild, ar, confirm,
                                  reprint=not already)
+    await after_commit(interaction.channel, interaction.guild)
 
 
 @client.tree.command(name="add", description="Join the queue (2-min auto-ready).")
@@ -685,6 +844,7 @@ async def match_report_cmd(interaction: discord.Interaction):
     # a next queue may have just been promoted into the active slot
     if pug.queue_ids():
         await render_active(interaction.channel, interaction.guild)
+    await after_commit(interaction.channel, interaction.guild)
 
 
 @match_group.command(name="put", description="Admin: move a player onto a team, or bench them.")
@@ -728,31 +888,37 @@ async def forceadd_cmd(interaction: discord.Interaction, players: str):
     if not is_admin(interaction.user):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
-    global _last_channel
-    _last_channel = interaction.channel
     ids = [int(m) for m in re.findall(r"<@!?(\d+)>", players)]
     if not ids:
         await interaction.response.send_message(
             "Mention at least one player, e.g. /forceadd players:@a @b", ephemeral=True)
         return
     busy = pug.slot_busy
-    added = []
+    added, skipped = [], []
     for uid in ids:
+        if cross_block_msg(uid):                   # committed in another lobby -> skip
+            skipped.append(uid)
+            continue
         ok, _ = pug.add(uid)                       # default 2-min auto-ready
         if ok:
             added.append(uid)
         if not busy and pug.phase not in (Phase.IDLE, Phase.QUEUING):
             break                                  # active queue just filled
+    note = ""
+    if skipped:
+        names = ", ".join(name_box(interaction.guild, u) for u in skipped)
+        note = f"\nSkipped (in a game elsewhere): {names}"
     if busy:                                        # slot occupied -> went to next queue
         await interaction.response.send_message(
-            f"Added {len(added)} to the next queue.\n{next_queue_display(interaction.guild)}")
+            f"Added {len(added)} to the next queue.{note}\n{next_queue_display(interaction.guild)}")
     elif pug.phase is Phase.READY_CHECK:
-        await interaction.response.send_message(f"Added {len(added)} — queue full, ready check:")
+        await interaction.response.send_message(f"Added {len(added)} — queue full, ready check:{note}")
         await launch_ready_check(interaction.channel, interaction.guild)
     elif pug.phase is Phase.PICKING:
         await interaction.response.send_message(embed=draft_embed(interaction.guild))
     else:
-        await interaction.response.send_message(queue_display(interaction.guild))
+        await interaction.response.send_message(queue_display(interaction.guild) + note)
+    await after_commit(interaction.channel, interaction.guild)
 
 
 immunity_group = app_commands.Group(name="immunity", description="Admin: manage med immunity.")
@@ -819,7 +985,6 @@ async def tosscoin_cmd(interaction: discord.Interaction):
 
 @client.tree.command(name="promote", description="Ping the pugger role with how many more players are needed.")
 async def promote_cmd(interaction: discord.Interaction):
-    global _last_promote
     if pug.slot_busy:
         await interaction.response.send_message(
             "A game is already forming or live — nothing to promote.", ephemeral=True)
@@ -828,12 +993,13 @@ async def promote_cmd(interaction: discord.Interaction):
     if needed <= 0:
         await interaction.response.send_message("The queue is already full.", ephemeral=True)
         return
-    remaining = PROMOTE_COOLDOWN - (time.monotonic() - _last_promote)
+    key = _cur_key.get()
+    remaining = PROMOTE_COOLDOWN - (time.monotonic() - _last_promote.get(key, 0.0))
     if remaining > 0:
         await interaction.response.send_message(
             f"`/promote` is on cooldown — try again in {int(remaining) + 1}s.", ephemeral=True)
         return
-    _last_promote = time.monotonic()
+    _last_promote[key] = time.monotonic()
     role = discord.utils.find(
         lambda r: r.name.lower() == PUG_PING_ROLE.lower(), interaction.guild.roles)
     mention = role.mention if role else f"@{PUG_PING_ROLE}"
@@ -885,21 +1051,25 @@ async def commands_cmd(interaction: discord.Interaction):
 # ---------- background ----------
 @tasks.loop(minutes=1)
 async def timeout_sweep():
-    dropped = pug.sweep_timeouts()
-    if dropped and _last_channel:
-        names = ", ".join(f"<@{uid}>" for uid in dropped)   # real ping so they're notified
-        hours = TIMEOUT_SECONDS // 3600
-        await _last_channel.send(f"{names} were removed from all queues (idle {hours}h).")
-    # auto-end a live game nobody reported (captains forget; ~50 min cap)
-    finished = pug.check_live_timeout()
-    if finished is not None and _last_channel:
-        mins = LIVE_AUTO_REPORT_SECONDS // 60
-        names = ", ".join(f"<@{uid}>" for uid in finished)
-        await _last_channel.send(
-            f"{names} game auto-ended after {mins} min (no /match report). "
-            "Queue open — /add to join.")
-        if pug.queue_ids():                       # a next queue may have been promoted
-            await render_active(_last_channel, _last_channel.guild)
+    for key, st in list(lobbies.items()):
+        ch = _lobby_channels.get(key)
+        _cur_key.set(key)
+        dropped = st.sweep_timeouts()
+        if dropped and ch:
+            names = ", ".join(f"<@{uid}>" for uid in dropped)   # real ping so they're notified
+            hours = TIMEOUT_SECONDS // 3600
+            await ch.send(f"{names} were removed from all queues (idle {hours}h).")
+        # auto-end a live game nobody reported (captains forget; ~50 min cap)
+        finished = st.check_live_timeout()
+        if finished is not None and ch:
+            mins = LIVE_AUTO_REPORT_SECONDS // 60
+            names = ", ".join(f"<@{uid}>" for uid in finished)
+            await ch.send(
+                f"{names} game auto-ended after {mins} min (no /match report). "
+                "Queue open — /add to join.")
+            if st.queue_ids():                       # a next queue may have been promoted
+                await render_active(ch, ch.guild)
+                await after_commit(ch, ch.guild)
 
 
 @tasks.loop(seconds=5)
@@ -913,7 +1083,17 @@ DEBUG = os.environ.get("PUG_DEBUG") == "1"
 if DEBUG:
     FAKE_BASE = 900000
 
-    @client.tree.command(name="fill", description="DEBUG: add fake players to the queue.")
+    def _next_fake_id():
+        """Smallest fake id not already in use (active queue, next queue, or
+        named), so repeated /fill calls never collide with bots already added."""
+        used = set(pug.queue) | set(pug.next_queue) | set(FAKE_NAMES)
+        fid = FAKE_BASE
+        while fid in used:
+            fid += 1
+        return fid
+
+    @client.tree.command(name="fill",
+                         description="DEBUG: add fake players (to the next queue if a game is forming/live).")
     @app_commands.describe(count="How many fake players to add (1-12)",
                            ready="Auto-confirm them (True) or leave them waiting (False)")
     async def fill_cmd(interaction: discord.Interaction,
@@ -921,25 +1101,31 @@ if DEBUG:
         if not is_admin(interaction.user):
             await interaction.response.send_message("Admins only.", ephemeral=True)
             return
-        global _last_channel
-        _last_channel = interaction.channel
         ar = AR_COMMAND_SECONDS if ready else -1   # -1 => already expired => "waiting"
+        target_next = pug.slot_busy                # game forming/live -> bots go to the NEXT queue
         added = 0
-        for i in range(count):
-            fid = FAKE_BASE + i
-            FAKE_NAMES[fid] = f"Bot{i+1}"
+        for _ in range(count):
+            fid = _next_fake_id()
+            FAKE_NAMES[fid] = f"Bot{fid - FAKE_BASE + 1}"
             ok, _ = pug.add(fid, ar)
-            if ok:
-                added += 1
-            if pug.phase is not Phase.QUEUING:     # filled -> ready check / draft
+            if not ok:                             # queue/next queue full -> undo the label and stop
+                FAKE_NAMES.pop(fid, None)
                 break
-        if pug.phase is Phase.READY_CHECK:
+            added += 1
+            if not target_next and pug.phase is not Phase.QUEUING:
+                break                              # active queue just filled -> don't spill into next
+        if target_next:
+            await interaction.response.send_message(
+                f"Filled {added} bot(s) into the **next queue** "
+                f"({len(pug.next_queue)}/{QUEUE_SIZE}).")
+        elif pug.phase is Phase.READY_CHECK:
             await interaction.response.send_message(f"Filled {added} bots — ready check:")
             await launch_ready_check(interaction.channel, interaction.guild)
         elif pug.phase is Phase.PICKING:
             await interaction.response.send_message(embed=draft_embed(interaction.guild))
         else:
             await interaction.response.send_message(queue_display(interaction.guild))
+        await after_commit(interaction.channel, interaction.guild)
 
     @client.tree.command(name="forceready", description="DEBUG: mark everyone ready (skip the timer).")
     async def forceready_cmd(interaction: discord.Interaction):
