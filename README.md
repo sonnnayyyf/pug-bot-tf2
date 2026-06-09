@@ -18,7 +18,7 @@ Built with [discord.py](https://github.com/Rapptz/discord.py) (slash commands + 
 - **Next queue** — while a game is forming or live, new joins line up in a separate queue; when the active match is reported, that queue is promoted (and starts its own ready check if it's already full). One game forms/plays at a time, with the next lined up behind it.
 - **Auto-report** — a live game with no manual `/match report` auto-ends after 50 minutes (configurable), so a forgotten report can't strand the queue overnight.
 - **Persistence** — all state (queue, live match, immunity, auto-ready, next queue) is snapshotted to a local SQLite file (`pug.db`) and reloaded on boot, so a restart or crash resumes the active game instead of wiping it.
-- **Single-channel lock** — set `PUG_CHANNEL_ID` and the bot only responds in that one channel; commands anywhere else are ignored.
+- **Channel lock + multi-lobby** — set `PUG_CHANNEL_ID` to one channel and the bot only responds there; set it to **two (or more) channel IDs** (comma- or space-separated) and the bot runs that many fully independent games at once, one per channel. Leave it unset and the bot responds everywhere as a single game. With two lobbies, med immunity is shared per-player, and a player can sit in both queues while waiting but is pulled into only one game the instant they confirm a ready check — after that they can't queue anywhere until that game reports.
 - **Rally + coin toss** — `/promote` pings a configurable role with how many more players are needed (2-min cooldown); `/tosscoin` flips heads/tails for first pick or side.
 - **Admin controls** — `/match report` (end a live game or cancel a forming one), `/match put` (move a player to a team or the bench, captains included), `/immunity` (manage med immunity), `/reset` (re-roll a stuck draft), `/clear` (clears the next queue mid-game, the active queue otherwise), and `/forceadd` (rebuild a queue, e.g. after a restart).
 - **Debug harness** (opt-in) for testing the full flow solo without 12 humans.
@@ -116,7 +116,7 @@ Configuration is read from environment variables, loaded from a local `.env` fil
 |---|---|---|
 | `DISCORD_TOKEN` | yes | Your bot token |
 | `TEST_GUILD_ID` | no | A server ID for **instant** slash-command sync during development. Omit for global sync (can take ~1h to propagate). |
-| `PUG_CHANNEL_ID` | no | Lock the bot to a single channel (by ID). Unset = responds everywhere. |
+| `PUG_CHANNEL_ID` | no | One channel ID locks the bot to that channel. **Two or more IDs** (comma- or space-separated) run that many independent games, one per channel. Unset = responds everywhere as one game. (`PUG_CHANNEL_IDS` is accepted as an alias.) |
 | `CONNECT_CHANNEL_ID` | no | Channel ID shown as a clickable link on the live teams embed ("head to #connect-string"). |
 | `PUG_DB` | no | Path to the SQLite state file (default `pug.db`). |
 | `PUG_DEBUG` | no | Set to `1` to enable the debug commands. |
@@ -126,7 +126,8 @@ Create a `.env` file in the project root:
 ```
 DISCORD_TOKEN=your_actual_token_here
 TEST_GUILD_ID=your_server_id_here
-PUG_CHANNEL_ID=your_pug_channel_id      # optional
+PUG_CHANNEL_ID=your_pug_channel_id      # optional; one ID = one game,
+                                        # two IDs (comma/space separated) = two games
 CONNECT_CHANNEL_ID=your_connect_channel_id   # optional
 ```
 
