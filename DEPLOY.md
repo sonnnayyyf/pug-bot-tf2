@@ -44,13 +44,17 @@ python3 -m venv .venv
 cat > .env <<'EOF'
 DISCORD_TOKEN=your-bot-token-here
 TEST_GUILD_ID=your-server-id        # instant slash-command sync for one guild
-PUG_CHANNEL_ID=your-channel-id      # lock the bot to one channel (optional)
+PUG_CHANNEL_ID=your-channel-id      # one ID locks to one channel; two IDs = two games (optional)
 EOF
 ```
 
 Leave `PUG_CHANNEL_ID` out to let the bot work in every channel. To lock it to a
 single channel, turn on Discord Developer Mode (User Settings > Advanced), then
-right-click the channel > Copy Channel ID and paste it in.
+right-click the channel > Copy Channel ID and paste it in. To run **two
+independent games at once**, put both channel IDs here separated by a comma or
+space, e.g. `PUG_CHANNEL_ID=123456789,987654321`. Each channel gets its own
+queue, ready check, draft and live game; med immunity is shared per-player and
+nobody can be in two games at the same time (see the README for the full rule).
 
 Leave `PUG_DEBUG` out (debug commands stay off in production).
 
@@ -104,3 +108,22 @@ on the server. (To wipe state deliberately, stop the bot and delete `pug.db`.)
 - **Behaviour-only changes** (logic, wording): just pull + restart.
 - **New or renamed slash commands:** the bot re-syncs on startup, so a restart
   registers them — instantly with `TEST_GUILD_ID` set, up to ~1h globally.
+
+### One-time: upgrading to the multi-lobby build
+
+The multi-lobby version changes the `pug.db` snapshot format (it now stores one
+state per channel plus shared immunity, instead of a single game). The new code
+**ignores an old single-game snapshot safely** — it just starts fresh rather
+than crashing — so no manual step is strictly required. But to avoid any
+half-loaded state, the clean upgrade is a one-time wipe:
+
+```bash
+# on the server, after pulling the new code:
+sudo systemctl stop tf2pug
+rm -f pug.db pug.db-wal pug.db-shm     # whichever exist
+sudo systemctl start tf2pug
+```
+
+On Wispbyte: **Stop** the server, delete `pug.db*` in the file manager, set
+`PUG_CHANNEL_ID` to your two channel IDs, then **Start**. After this first wipe,
+restarts resume state normally as before.
