@@ -20,7 +20,8 @@ Built with [discord.py](https://github.com/Rapptz/discord.py) (slash commands + 
 - **Persistence** — all state (queue, live match, immunity, auto-ready, next queue) is snapshotted to a local SQLite file (`pug.db`) and reloaded on boot, so a restart or crash resumes the active game instead of wiping it.
 - **Channel lock + multi-lobby** — set `PUG_CHANNEL_ID` to one channel and the bot only responds there; set it to **two (or more) channel IDs** (comma- or space-separated) and the bot runs that many fully independent games at once, one per channel. Leave it unset and the bot responds everywhere as a single game. With two lobbies, med immunity is shared per-player, and a player can sit in both queues while waiting but is pulled into only one game the instant they confirm a ready check — after that they can't queue anywhere until that game reports.
 - **Rally + coin toss** — `/promote` pings a configurable role with how many more players are needed (2-min cooldown); `/tosscoin` flips heads/tails for first pick or side.
-- **Admin controls** — `/match report` (end a live game or cancel a forming one), `/match put` (move a player to a team or the bench, captains included), `/immunity` (manage med immunity), `/reset` (re-roll a stuck draft), `/clear` (clears the next queue mid-game, the active queue otherwise), and `/forceadd` (rebuild a queue, e.g. after a restart).
+- **Player stats** — every completed game is counted per player; `/captstat` shows the top 10 most-rolled captains and `/stat [@player]` shows someone's total games and how many they captained. Counts are lifetime and shared across both lobbies.
+- **Admin controls** — `/match report` (end a live game or cancel a forming one), `/match put` (move a player to a team, a captain slot, or the bench — assigning a captain bumps the old one to unpicked), `/immunity` (manage med immunity), `/reset` (re-roll a stuck draft), `/clear` (clears the next queue mid-game, the active queue otherwise), and `/forceadd` (rebuild a queue, e.g. after a restart).
 - **Debug harness** (opt-in) for testing the full flow solo without 12 humans.
 
 ---
@@ -60,6 +61,8 @@ IDLE → QUEUING → READY_CHECK → PICKING → LIVE → (report) → IDLE
 | `/subfor [@player]` | Sub in for someone (draft stage only) |
 | `/promote` | Ping the rally role with how many more players are needed (2-min cooldown) |
 | `/tosscoin` | Flip a coin — heads or tails |
+| `/captstat` | Top 10 players by times rolled as captain |
+| `/stat [@player]` | A player's total games played and how many as captain (defaults to you) |
 | `/commands` | Show the command list |
 
 ### Admin
@@ -67,7 +70,7 @@ IDLE → QUEUING → READY_CHECK → PICKING → LIVE → (report) → IDLE
 | Command | What it does |
 |---|---|
 | `/match report` | End a live game (captain/admin) or cancel a forming match (admin) |
-| `/match put @player red\|blu\|bench` | Move a player to a team or the bench (captains included — they step down) |
+| `/match put @player red\|blu\|capt red\|capt blu\|bench` | Move a player to a team, into a captain slot, or the bench. Putting someone into a captain slot bumps the previous captain there back to unpicked |
 | `/immunity show\|set\|add\|clear` | View or adjust med immunity |
 | `/reset` | Unstick a frozen draft by re-rolling captains |
 | `/clear` | Clear the next queue if a game is on, otherwise the active queue |
