@@ -43,12 +43,16 @@ PICK_ORDER = [
 
 
 class PugState:
-    def __init__(self, now=time.time, immunity=None):
+    def __init__(self, now=time.time, immunity=None, stats=None):
         self._now = now
         # immunity may be a dict shared across several PugStates (multi-lobby:
         # immunity is a property of the player, not the channel). We only ever
         # mutate it in place so the shared reference stays intact.
         self.immunity = immunity if immunity is not None else {}
+        # lifetime per-player counters {uid: {"games": n, "capt": n}}, also a
+        # shared-across-lobbies dict, bumped once when a game goes live. Pure
+        # bookkeeping the engine never reads back; persisted by the bot layer.
+        self.stats = stats if stats is not None else {}
         self.auto_ready_until = {}    # uid -> epoch its auto-ready window ends
         self.next_queue = {}          # uid -> joined_at; players waiting for the NEXT game
         self.reset_match()
@@ -380,9 +384,19 @@ class PugState:
 
     def _go_live(self):
         self._apply_immunity()
+        self._bump_stats()
         self.phase = Phase.LIVE
         self.live_since = self._now()
         return True, "Teams set. GLHF!"
+
+    def _bump_stats(self):
+        """Count one game played for everyone on the final roster, and one
+        captain appearance for each captain. Called exactly once, at go-live."""
+        for p in self._all_players():
+            rec = self.stats.setdefault(p, {"games": 0, "capt": 0})
+            rec["games"] += 1
+        for c in set(self.capt_of.values()):
+            self.stats.setdefault(c, {"games": 0, "capt": 0})["capt"] += 1
 
     def check_live_timeout(self):
         """Auto-end a live game that's run past the report window (handles
@@ -477,25 +491,32 @@ class PugState:
                 self.phase = Phase.QUEUING
 
     def match_put(self, uid, where):
-        """Admin: move a player onto a team, or to the bench (off all teams).
-        Used to rebalance. Moving a captain steps them down from captaincy first
-        (their old side is left open — assign a new captain with /capfor)."""
+        """Admin: move a player onto a team, into a captain slot, or to the bench.
+        Used to rebalance. Moving a player out of a captain slot frees it; moving
+        one INTO a captain slot bumps the previous captain there to unpicked."""
         if self.phase not in (Phase.PICKING, Phase.LIVE):
             return False, "No teams to move players between yet."
         where = where.upper()
-        if where not in ("RED", "BLU", "BENCH"):
-            return False, "Target must be red, blu, or bench."
+        if where not in ("RED", "BLU", "BENCH", "CAPT_RED", "CAPT_BLU"):
+            return False, "Target must be red, blu, a captain slot, or bench."
         if uid not in self.queue:
             return False, "That player isn't in this match."
         was_capt = None
-        for color, c in list(self.capt_of.items()):     # if a captain, free the slot
+        for color, c in list(self.capt_of.items()):     # detach from any captaincy
             if c == uid:
                 was_capt = color
                 del self.capt_of[color]
-        for c in ("RED", "BLU"):
+        for c in ("RED", "BLU"):                          # detach from team picks
             if uid in self.team[c]:
                 self.team[c].remove(uid)
-        note = f" (stepped down as {was_capt} captain)" if was_capt else ""
+        note = f" (was {was_capt} captain)" if was_capt else ""
+        if where in ("CAPT_RED", "CAPT_BLU"):
+            color = "RED" if where == "CAPT_RED" else "BLU"
+            displaced = self.capt_of.get(color)
+            self.capt_of[color] = uid
+            dnote = (f" <@{displaced}> is now unpicked." if displaced and displaced != uid
+                     else "")
+            return True, f"Made <@{uid}> {color} captain{note}.{dnote}"
         if where == "BENCH":
             return True, f"Moved <@{uid}> to the bench{note}."
         if uid not in self.team[where]:
@@ -871,5 +892,41 @@ if __name__ == "__main__":
     assert {102, 103, 104, 105, 106} == set(s.next_queue)
     assert s.phase in (Phase.READY_CHECK, Phase.PICKING)  # a fresh check on the 12
     print("V) failed ready check refills to 12 and never overflows the queue")
+
+    # W) stats: a completed game bumps games for all 12 and capt for the 2 captains;
+    #    a shared stats dict accumulates across multiple PugStates (lobbies).
+    clock["t"] = 1000.0
+    shared_stats = {}
+    s = PugState(now=NOW, stats=shared_stats); fill(s, P)
+    caps = drive_draft(s)
+    assert s.phase is Phase.LIVE
+    assert all(shared_stats[p]["games"] == 1 for p in P), shared_stats
+    assert shared_stats[caps[0]]["capt"] == 1 and shared_stats[caps[1]]["capt"] == 1
+    assert sum(r["capt"] for r in shared_stats.values()) == 2   # exactly 2 captains counted
+    s.match_report(caps[0])
+    # a SECOND lobby sharing the same dict adds to the same totals
+    s2 = PugState(now=NOW, stats=shared_stats); fill(s2, P)
+    caps2 = drive_draft(s2)
+    assert all(shared_stats[p]["games"] == 2 for p in P), "games should accumulate to 2"
+    # whoever captained in both games now shows capt == 2
+    twice = [c for c in caps if c in caps2]
+    assert all(shared_stats[c]["capt"] == 2 for c in twice)
+    print("W) stats count games + captaincies and accumulate across shared lobbies")
+
+    # X) match_put can drop a player into a captain slot, bumping the old captain
+    clock["t"] = 1000.0
+    s = fresh(); fill(s, P)
+    caps = drive_draft(s)                         # LIVE, both captains set
+    old_red = s.capt_of["RED"]
+    victim = next(u for u in P if u not in s.capt_of.values())   # some non-captain
+    ok, msg = s.match_put(victim, "capt_red")
+    assert ok and s.capt_of["RED"] == victim, (msg, s.capt_of)
+    assert old_red != victim and old_red in s.unpicked()         # old captain bumped to unpicked
+    assert victim not in s.team["RED"] and victim not in s.team["BLU"]
+    # putting a current captain onto a team frees their slot
+    blu_cap = s.capt_of["BLU"]
+    ok, msg = s.match_put(blu_cap, "red")
+    assert ok and "BLU" not in s.capt_of and blu_cap in s.team["RED"], (msg, s.capt_of)
+    print("X) match_put assigns/bumps captains and frees slots")
 
     print("\nall smoke tests passed.")
