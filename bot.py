@@ -92,6 +92,7 @@ from lobby import reconcile, blocking_cid
 
 # ---------- lobby registry (one independent game per configured channel) ----------
 SHARED_IMMUNITY = {}             # med immunity is shared across lobbies (per-player)
+SHARED_STATS = {}                # lifetime {uid: {"games", "capt"}}, shared across lobbies
 _SINGLE = None                   # lobby key used when no channels are configured
 lobbies = {}                     # lobby_key -> PugState
 _ready_views = {}                # lobby_key -> ReadyView | None
@@ -101,7 +102,7 @@ _last_promote = {}               # lobby_key -> monotonic time of last /promote 
 
 
 def _new_state():
-    return PugState(immunity=SHARED_IMMUNITY)
+    return PugState(immunity=SHARED_IMMUNITY, stats=SHARED_STATS)
 
 
 # Pre-create the configured lobbies (or a single shared one if none configured).
@@ -204,6 +205,7 @@ def persist():
     payload = {
         "v": 2,
         "immunity": SHARED_IMMUNITY,
+        "stats": SHARED_STATS,
         "fake_names": FAKE_NAMES,
         "lobbies": {
             str(key): {
@@ -552,6 +554,10 @@ class PugClient(discord.Client):
             SHARED_IMMUNITY.clear()
             SHARED_IMMUNITY.update(
                 {int(k): int(v) for k, v in (saved.get("immunity") or {}).items()})
+            SHARED_STATS.clear()
+            SHARED_STATS.update(
+                {int(k): {"games": int(v.get("games", 0)), "capt": int(v.get("capt", 0))}
+                 for k, v in (saved.get("stats") or {}).items()})
             for k_str, lob in saved["lobbies"].items():
                 key = _SINGLE if k_str == "None" else int(k_str)
                 if key not in lobbies:
@@ -847,11 +853,13 @@ async def match_report_cmd(interaction: discord.Interaction):
     await after_commit(interaction.channel, interaction.guild)
 
 
-@match_group.command(name="put", description="Admin: move a player onto a team, or bench them.")
-@app_commands.describe(player="Player to move", team="Target: a team, or the bench")
+@match_group.command(name="put", description="Admin: move a player onto a team, a captain slot, or the bench.")
+@app_commands.describe(player="Player to move", team="Target: a team, a captain slot, or the bench")
 @app_commands.choices(team=[
     app_commands.Choice(name="RED", value="red"),
     app_commands.Choice(name="BLU", value="blu"),
+    app_commands.Choice(name="Captain RED", value="capt_red"),
+    app_commands.Choice(name="Captain BLU", value="capt_blu"),
     app_commands.Choice(name="Bench", value="bench"),
 ])
 async def match_put_cmd(interaction: discord.Interaction,
@@ -978,6 +986,38 @@ async def clear_cmd(interaction: discord.Interaction):
 
 
 # ---------- slash: info ----------
+@client.tree.command(name="captstat", description="Top 10 players by times rolled as captain.")
+async def captstat_cmd(interaction: discord.Interaction):
+    rows = [(uid, rec) for uid, rec in SHARED_STATS.items()
+            if uid not in FAKE_NAMES and rec.get("capt", 0) > 0]
+    rows.sort(key=lambda r: (-r[1].get("capt", 0), -r[1].get("games", 0)))
+    if not rows:
+        await interaction.response.send_message(
+            "No captain stats yet — play some games first!")
+        return
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = [f"{medals.get(i, f'{i}.')} {name_box(interaction.guild, uid)} — "
+             f"**{rec['capt']}**× captain ({rec.get('games', 0)} games)"
+             for i, (uid, rec) in enumerate(rows[:10], 1)]
+    await interaction.response.send_message("🏅 **Most-rolled captains**\n" + "\n".join(lines))
+
+
+@client.tree.command(name="stat", description="Show a player's games played and times captained.")
+@app_commands.describe(player="(optional) whose stats to show — defaults to you")
+async def stat_cmd(interaction: discord.Interaction, player: Optional[discord.Member] = None):
+    member = player or interaction.user
+    rec = SHARED_STATS.get(member.id) or {"games": 0, "capt": 0}
+    g, c = rec.get("games", 0), rec.get("capt", 0)
+    if g == 0:
+        await interaction.response.send_message(
+            f"📊 {name_box(interaction.guild, member.id)} hasn't finished any games yet.")
+        return
+    pct = f" — {round(100 * c / g)}% of games" if c else ""
+    await interaction.response.send_message(
+        f"📊 {name_box(interaction.guild, member.id)} — **{g}** game(s) played, "
+        f"**{c}** as captain{pct}.")
+
+
 @client.tree.command(name="tosscoin", description="Flip a coin — heads or tails.")
 async def tosscoin_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(f"🪙 **{random.choice(('Heads', 'Tails'))}**")
@@ -1036,11 +1076,12 @@ async def commands_cmd(interaction: discord.Interaction):
         "`/queue` — show queue or teams\n"
         "`/promote` — ping the pugger role for more players\n"
         "`/tosscoin` — flip a coin (heads/tails)\n"
+        "`/captstat` — top 10 most-rolled captains · `/stat [@user]` — a player's games + captaincies\n"
         "`/capfor red|blu` — volunteer to captain · `/capoff` — step down\n"
         "`/pick @user` — draft a player\n"
         "`/subme` — request a sub · `/subfor` — sub in (draft stage)\n"
         "`/match report` — end/cancel a match\n"
-        "`/match put @player red|blu|bench` — admin: move a player to a team or bench\n"
+        "`/match put @player red|blu|capt red|capt blu|bench` — admin: move a player to a team, a captain slot, or the bench\n"
         "`/immunity show|set|add|clear` — admin: manage med immunity\n"
         "`/reset` · `/clear` · `/forceadd` — admin\n"
         "\n*While a game is live, new joins line up in the **next queue** and start once it's reported.*"
