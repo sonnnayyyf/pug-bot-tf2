@@ -27,7 +27,7 @@ from storage import Store
 from pug_state import (PugState, Phase, QUEUE_SIZE,
                        DEFAULT_AR_SECONDS, AR_COMMAND_SECONDS,
                        MAX_AR_SECONDS, READY_CHECK_SECONDS, TIMEOUT_SECONDS,
-                       LIVE_AUTO_REPORT_SECONDS)
+                       ELO_START)
 
 # Load DISCORD_TOKEN / TEST_GUILD_ID / PUG_DEBUG from a local .env file if
 # python-dotenv is installed; otherwise fall back to shell environment vars.
@@ -92,7 +92,7 @@ from lobby import reconcile, blocking_cid
 
 # ---------- lobby registry (one independent game per configured channel) ----------
 SHARED_IMMUNITY = {}             # med immunity is shared across lobbies (per-player)
-SHARED_STATS = {}                # lifetime {uid: {"games", "capt"}}, shared across lobbies
+SHARED_STATS = {}                # lifetime {uid: {"games","capt","w","l","elo"}}, shared across lobbies
 _SINGLE = None                   # lobby key used when no channels are configured
 lobbies = {}                     # lobby_key -> PugState
 _ready_views = {}                # lobby_key -> ReadyView | None
@@ -292,6 +292,14 @@ def fmt_dur(seconds: int) -> str:
     return f"{m}:{s:02d}"
 
 
+def _ago(ts) -> str:
+    """A Discord relative timestamp (renders as e.g. '5 minutes ago' per viewer)."""
+    try:
+        return f"<t:{int(ts)}:R>"
+    except (TypeError, ValueError):
+        return "earlier"
+
+
 def success_embed(ar_seconds: int) -> discord.Embed:
     return discord.Embed(
         title="Success",
@@ -388,7 +396,8 @@ def final_embed(guild) -> discord.Embed:
     lines.append("—")
     connect = f"<#{CONNECT_CHANNEL_ID}>" if CONNECT_CHANNEL_ID else "#connect-string"
     lines.append(f"➡️ Head to {connect} to join the server.")
-    lines.append("Admins: /match report to end or cancel.")
+    lines.append("When it's over: **/match report red** or **/match report blu**.")
+    lines.append("Admins: **/match cancel** to void a game with no result.")
     return discord.Embed(title="Teams set — GLHF!",
                          description="\n".join(lines),
                          color=discord.Color.green())
@@ -839,15 +848,43 @@ async def subfor_cmd(interaction: discord.Interaction, player: Optional[discord.
 match_group = app_commands.Group(name="match", description="Match controls.")
 
 
-@match_group.command(name="report", description="End a live game (captain/admin) or cancel a forming match (admin).")
-async def match_report_cmd(interaction: discord.Interaction):
-    ok, msg, pinged = pug.match_report(interaction.user.id, is_admin(interaction.user))
+@match_group.command(name="report", description="Report the winner of the live game (captain or admin).")
+@app_commands.describe(winner="Which team won")
+@app_commands.choices(winner=[
+    app_commands.Choice(name="RED win", value="red"),
+    app_commands.Choice(name="BLU win", value="blu"),
+])
+async def match_report_cmd(interaction: discord.Interaction,
+                           winner: app_commands.Choice[str]):
+    ok, msg, pinged = pug.match_report(interaction.user.id, is_admin(interaction.user),
+                                       winner=winner.value)
     if not ok:
         await interaction.response.send_message(msg, ephemeral=True)
         return
-    mentions = ", ".join(f"<@{u}>" for u in pinged)   # cancellation SHOULD ping
-    await interaction.response.send_message(f"{mentions} {msg}" if mentions else msg)
+    # a recorded game is written to the append-only audit log and tagged with its id
+    result = pug.last_result
+    if result is not None:
+        mid = store.log_event("match", {**result, "channel_id": interaction.channel.id})
+        if mid is not None:
+            msg = f"**Match #{mid}** — {msg}"
+    await interaction.response.send_message(msg)
     # a next queue may have just been promoted into the active slot
+    if pug.queue_ids():
+        await render_active(interaction.channel, interaction.guild)
+    await after_commit(interaction.channel, interaction.guild)
+
+
+@match_group.command(name="cancel", description="Admin: end a match with NO result — void a live game or scrap a forming one.")
+async def match_cancel_cmd(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    ok, msg, pinged = pug.match_cancel(interaction.user.id, is_admin=True)
+    if not ok:
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+    mentions = ", ".join(f"<@{u}>" for u in pinged)   # cancellation SHOULD ping the players
+    await interaction.response.send_message(f"{mentions} {msg}" if mentions else msg)
     if pug.queue_ids():
         await render_active(interaction.channel, interaction.guild)
     await after_commit(interaction.channel, interaction.guild)
@@ -873,6 +910,53 @@ async def match_put_cmd(interaction: discord.Interaction,
         return
     embed = final_embed(interaction.guild) if pug.phase is Phase.LIVE else draft_embed(interaction.guild)
     await interaction.response.send_message(embed=embed)
+
+
+@match_group.command(name="log", description="Show the most recent reported matches.")
+async def match_log_cmd(interaction: discord.Interaction):
+    events = store.recent_events(limit=10, kind="match")
+    if not events:
+        await interaction.response.send_message("No matches recorded yet.")
+        return
+    lines = []
+    for e in events:
+        d = e["data"]
+        win = d.get("winner", "?")
+        dot = "🔴" if win == "RED" else "🔵"
+        lines.append(f"**#{e['id']}** {dot} {win} win · Δ{d.get('delta', 0)} · "
+                     f"{_ago(e['ts'])}")
+    await interaction.response.send_message(
+        "🗒️ **Recent matches** (use `/match info <id>` for detail)\n" + "\n".join(lines))
+
+
+@match_group.command(name="info", description="Show the detail of one recorded match by its id.")
+@app_commands.describe(match_id="The match number (see /match log)")
+async def match_info_cmd(interaction: discord.Interaction, match_id: int):
+    e = store.get_event(match_id)
+    if e is None or e.get("kind") != "match":
+        await interaction.response.send_message(f"No match #{match_id}.", ephemeral=True)
+        return
+    d = e["data"]
+    dot = {"RED": "🔴", "BLU": "🔵"}
+    elos = d.get("elos", {})
+
+    def side(color):
+        out = []
+        for uid in d.get(color.lower(), []):
+            ba = elos.get(str(uid)) or elos.get(uid)        # keys are strings after JSON
+            tag = name_box(interaction.guild, uid)
+            if ba:
+                out.append(f"{tag} ({ba[0]}→{ba[1]})")
+            else:
+                out.append(tag)
+        return ", ".join(out) or "—"
+
+    win = d.get("winner", "?")
+    lines = [f"**Match #{e['id']}** · {dot.get(win, '')} **{win} win** · "
+             f"swing Δ{d.get('delta', 0)} · {_ago(e['ts'])}",
+             f"🔴 RED: {side('RED')}",
+             f"🔵 BLU: {side('BLU')}"]
+    await interaction.response.send_message("\n".join(lines))
 
 
 client.tree.add_command(match_group)
@@ -1002,20 +1086,99 @@ async def captstat_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("🏅 **Most-rolled captains**\n" + "\n".join(lines))
 
 
-@client.tree.command(name="stat", description="Show a player's games played and times captained.")
+@client.tree.command(name="stat", description="Show a player's Elo, record, and games.")
 @app_commands.describe(player="(optional) whose stats to show — defaults to you")
 async def stat_cmd(interaction: discord.Interaction, player: Optional[discord.Member] = None):
     member = player or interaction.user
-    rec = SHARED_STATS.get(member.id) or {"games": 0, "capt": 0}
-    g, c = rec.get("games", 0), rec.get("capt", 0)
+    rec = SHARED_STATS.get(member.id) or {}
+    g = rec.get("games", 0)
     if g == 0:
-        await interaction.response.send_message(
-            f"📊 {name_box(interaction.guild, member.id)} hasn't finished any games yet.")
+        empty = discord.Embed(
+            title=f"📊 {display_name(interaction.guild, member.id)}",
+            description="Hasn't finished any games yet.",
+            color=discord.Color.light_grey())
+        await interaction.response.send_message(embed=empty)
         return
-    pct = f" — {round(100 * c / g)}% of games" if c else ""
-    await interaction.response.send_message(
-        f"📊 {name_box(interaction.guild, member.id)} — **{g}** game(s) played, "
-        f"**{c}** as captain{pct}.")
+    c = rec.get("capt", 0)
+    w, l = rec.get("w", 0), rec.get("l", 0)
+    elo = rec.get("elo", ELO_START)
+    decided = w + l
+    wr = f"{round(100 * w / decided)}%" if decided else "—"
+    capt_val = f"{c}  ·  {round(100 * c / g)}% of games" if c else "—"
+
+    # Elo rank among everyone who's played (bots excluded)
+    ranked = sorted(
+        (u for u, r in SHARED_STATS.items()
+         if u not in FAKE_NAMES and r.get("games", 0) > 0),
+        key=lambda u: (-SHARED_STATS[u].get("elo", ELO_START),
+                       -SHARED_STATS[u].get("games", 0)))
+    rank = ranked.index(member.id) + 1 if member.id in ranked else None
+
+    embed = discord.Embed(
+        title=f"📊 {display_name(interaction.guild, member.id)}",
+        color=discord.Color.blurple())
+    if member.id not in FAKE_NAMES:
+        embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Elo", value=f"**{elo}**", inline=True)
+    embed.add_field(name="Record", value=f"{w}W – {l}L", inline=True)
+    embed.add_field(name="Win rate", value=wr, inline=True)
+    embed.add_field(name="Games", value=str(g), inline=True)
+    embed.add_field(name="Captain", value=capt_val, inline=True)
+    embed.add_field(name="\u200b", value="\u200b", inline=True)   # keep the 3-col grid tidy
+    if rank is not None:
+        embed.set_footer(text=f"Elo rank #{rank} of {len(ranked)}")
+    await interaction.response.send_message(embed=embed)
+
+
+elo_group = app_commands.Group(name="elo", description="Ratings.")
+
+
+@elo_group.command(name="top", description="Top 10 players by Elo rating.")
+async def elo_top_cmd(interaction: discord.Interaction):
+    rows = [(uid, rec) for uid, rec in SHARED_STATS.items()
+            if uid not in FAKE_NAMES and rec.get("games", 0) > 0]
+    rows.sort(key=lambda r: (-r[1].get("elo", ELO_START), -r[1].get("games", 0)))
+    if not rows:
+        await interaction.response.send_message(
+            "No rated games yet — play some games first!")
+        return
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = [f"{medals.get(i, f'{i}.')} {name_box(interaction.guild, uid)} — "
+             f"**{rec.get('elo', ELO_START)}** Elo "
+             f"({rec.get('w', 0)}W–{rec.get('l', 0)}L)"
+             for i, (uid, rec) in enumerate(rows[:10], 1)]
+    await interaction.response.send_message("📈 **Top Elo**\n" + "\n".join(lines))
+
+
+@elo_group.command(name="set", description="Admin: set a player's Elo to an exact value.")
+@app_commands.describe(player="Player", rating="New Elo rating")
+async def elo_set_cmd(interaction: discord.Interaction,
+                      player: discord.Member, rating: app_commands.Range[int, 0, 5000]):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    ok, msg, before, after = pug.set_elo(player.id, rating)
+    store.log_event("elo_adjust", {"mode": "set", "uid": player.id,
+                                   "by": interaction.user.id,
+                                   "before": before, "after": after})
+    await interaction.response.send_message(msg)
+
+
+@elo_group.command(name="add", description="Admin: nudge a player's Elo up or down.")
+@app_commands.describe(player="Player", amount="Amount to add (use a negative number to subtract)")
+async def elo_add_cmd(interaction: discord.Interaction,
+                      player: discord.Member, amount: app_commands.Range[int, -2000, 2000]):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    ok, msg, before, after = pug.add_elo(player.id, amount)
+    store.log_event("elo_adjust", {"mode": "add", "uid": player.id,
+                                   "by": interaction.user.id, "amount": int(amount),
+                                   "before": before, "after": after})
+    await interaction.response.send_message(msg)
+
+
+client.tree.add_command(elo_group)
 
 
 @client.tree.command(name="tosscoin", description="Flip a coin — heads or tails.")
@@ -1076,13 +1239,17 @@ async def commands_cmd(interaction: discord.Interaction):
         "`/queue` — show queue or teams\n"
         "`/promote` — ping the pugger role for more players\n"
         "`/tosscoin` — flip a coin (heads/tails)\n"
-        "`/captstat` — top 10 most-rolled captains · `/stat [@user]` — a player's games + captaincies\n"
+        "`/captstat` — top 10 most-rolled captains · `/elo top` — top 10 by rating\n"
+        "`/stat [@user]` — a player's Elo, W/L, win rate + captaincies\n"
         "`/capfor red|blu` — volunteer to captain · `/capoff` — step down\n"
         "`/pick @user` — draft a player\n"
         "`/subme` — request a sub · `/subfor` — sub in (draft stage)\n"
-        "`/match report` — end/cancel a match\n"
+        "`/match report red|blu` — report the winner of the live game (captain/admin)\n"
+        "`/match cancel` — admin: end a match with no result (void a live game or scrap a forming one)\n"
+        "`/match log` · `/match info <id>` — browse recorded matches\n"
         "`/match put @player red|blu|capt red|capt blu|bench` — admin: move a player to a team, a captain slot, or the bench\n"
         "`/immunity show|set|add|clear` — admin: manage med immunity\n"
+        "`/elo set|add @player` — admin: correct a rating\n"
         "`/reset` · `/clear` · `/forceadd` — admin\n"
         "\n*While a game is live, new joins line up in the **next queue** and start once it's reported.*"
     )
@@ -1100,17 +1267,6 @@ async def timeout_sweep():
             names = ", ".join(f"<@{uid}>" for uid in dropped)   # real ping so they're notified
             hours = TIMEOUT_SECONDS // 3600
             await ch.send(f"{names} were removed from all queues (idle {hours}h).")
-        # auto-end a live game nobody reported (captains forget; ~50 min cap)
-        finished = st.check_live_timeout()
-        if finished is not None and ch:
-            mins = LIVE_AUTO_REPORT_SECONDS // 60
-            names = ", ".join(f"<@{uid}>" for uid in finished)
-            await ch.send(
-                f"{names} game auto-ended after {mins} min (no /match report). "
-                "Queue open — /add to join.")
-            if st.queue_ids():                       # a next queue may have been promoted
-                await render_active(ch, ch.guild)
-                await after_commit(ch, ch.guild)
 
 
 @tasks.loop(seconds=5)
