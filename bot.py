@@ -403,6 +403,32 @@ def final_embed(guild) -> discord.Embed:
                          color=discord.Color.green())
 
 
+def results_embed(guild, mid, detail) -> discord.Embed:
+    """The post-report card: which team won and each player's Elo before → after.
+    `detail` is PugState.last_result (in-memory, int-keyed). Deliberately NOT a
+    monospace code block — those wrap badly on mobile; a plain list reads cleaner."""
+    winner = detail["winner"]
+    elos = detail["elos"]                       # {uid: [before, after]}
+    dots = {"RED": "🔴", "BLU": "🔵"}
+
+    def line(u):
+        before, after = elos[u]
+        return f"`{display_name(guild, u)}` {before} → **{after}**  ({after - before:+d})"
+
+    def field(side):
+        return "\n".join(line(u) for u in detail[side.lower()]) or "—"
+
+    colors = {"RED": discord.Color.red(), "BLU": discord.Color.blue()}
+    head = f"Match #{mid} — " if mid is not None else ""
+    embed = discord.Embed(title=f"{head}{winner} win 🏆",
+                          color=colors.get(winner, discord.Color.green()))
+    order = ("RED", "BLU") if winner == "RED" else ("BLU", "RED")   # winner on top
+    for side in order:
+        trophy = "  🏆" if side == winner else ""
+        embed.add_field(name=f"{dots[side]} {side}{trophy}", value=field(side), inline=False)
+    return embed
+
+
 # ---------- ready-check UI ----------
 class ReadyView(discord.ui.View):
     def __init__(self, channel, guild, key=_SINGLE):
@@ -863,11 +889,11 @@ async def match_report_cmd(interaction: discord.Interaction,
         return
     # a recorded game is written to the append-only audit log and tagged with its id
     result = pug.last_result
-    if result is not None:
-        mid = store.log_event("match", {**result, "channel_id": interaction.channel.id})
-        if mid is not None:
-            msg = f"**Match #{mid}** — {msg}"
-    await interaction.response.send_message(msg)
+    mid = (store.log_event("match", {**result, "channel_id": interaction.channel.id})
+           if result else None)
+    embed = results_embed(interaction.guild, mid, result)
+    embed.set_footer(text="Queue open — /add to join.")
+    await interaction.response.send_message(embed=embed)
     # a next queue may have just been promoted into the active slot
     if pug.queue_ids():
         await render_active(interaction.channel, interaction.guild)
