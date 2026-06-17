@@ -33,7 +33,9 @@ DEFAULT_AR_SECONDS = 2 * 60      # ++ / /add
 AR_COMMAND_SECONDS = 15 * 60     # !ar / /ar
 MAX_AR_SECONDS = 30 * 60         # /auto-ready hard cap
 READY_CHECK_SECONDS = 120        # window to ready up once queue is full (2 min)
-LIVE_AUTO_REPORT_SECONDS = 50 * 60  # auto-end a live game if no one reports (50 min)
+ELO_START = 1600                 # everyone's starting rating (cosmetic; never gates play)
+ELO_K = 32                       # rating responsiveness (per-player, before clamping)
+ELO_CLAMP = 20                   # hard cap on how much one game can move a player (±)
 
 # RED first. (team, picks_this_turn). 1-2-1-1-1-1-1-1-1 -> 5/5 picks = 6v6.
 PICK_ORDER = [
@@ -49,10 +51,18 @@ class PugState:
         # immunity is a property of the player, not the channel). We only ever
         # mutate it in place so the shared reference stays intact.
         self.immunity = immunity if immunity is not None else {}
-        # lifetime per-player counters {uid: {"games": n, "capt": n}}, also a
-        # shared-across-lobbies dict, bumped once when a game goes live. Pure
-        # bookkeeping the engine never reads back; persisted by the bot layer.
+        # lifetime per-player counters, a shared-across-lobbies dict:
+        #   {uid: {"games", "capt", "w", "l", "elo"}}
+        # games/capt are bumped at go-live; w/l/elo are recorded at report time
+        # (only a game with a declared winner counts). Old snapshots that predate
+        # the w/l/elo keys upgrade transparently (see _stat_rec). Persisted by the
+        # bot layer; the engine never reads it back to make decisions (cosmetic).
         self.stats = stats if stats is not None else {}
+        # Transient hand-off: set by match_report to the detail of the game just
+        # recorded (winner, rosters, per-player before/after Elo) so the bot can
+        # write it to the audit log. NOT persisted and NOT part of to_dict — it's
+        # read once, immediately after the report call, then ignored.
+        self.last_result = None
         self.auto_ready_until = {}    # uid -> epoch its auto-ready window ends
         self.next_queue = {}          # uid -> joined_at; players waiting for the NEXT game
         self.reset_match()
@@ -68,7 +78,7 @@ class PugState:
         self.turn_idx = 0
         self.picks_left = 0
         self.sub_requests = []
-        self.live_since = None        # epoch the game went LIVE (for auto-report)
+        self.live_since = None        # epoch the game went LIVE
 
     def reset_all(self):
         self.immunity.clear()
@@ -389,27 +399,99 @@ class PugState:
         self.live_since = self._now()
         return True, "Teams set. GLHF!"
 
+    def _stat_rec(self, uid):
+        """The lifetime record for `uid`, created — and back-filled — on demand.
+        Centralising the default shape here means a snapshot saved before the
+        w/l/elo keys existed upgrades transparently the first time it's touched,
+        so no DB migration or wipe is needed."""
+        rec = self.stats.setdefault(uid, {})
+        rec.setdefault("games", 0)
+        rec.setdefault("capt", 0)
+        rec.setdefault("w", 0)
+        rec.setdefault("l", 0)
+        rec.setdefault("elo", ELO_START)
+        return rec
+
     def _bump_stats(self):
         """Count one game played for everyone on the final roster, and one
-        captain appearance for each captain. Called exactly once, at go-live."""
+        captain appearance for each captain. Called exactly once, at go-live.
+        Win/loss and Elo are NOT touched here — the winner isn't known until a
+        game is reported (see _record_result)."""
         for p in self._all_players():
-            rec = self.stats.setdefault(p, {"games": 0, "capt": 0})
-            rec["games"] += 1
+            self._stat_rec(p)["games"] += 1
         for c in set(self.capt_of.values()):
-            self.stats.setdefault(c, {"games": 0, "capt": 0})["capt"] += 1
+            self._stat_rec(c)["capt"] += 1
 
-    def check_live_timeout(self):
-        """Auto-end a live game that's run past the report window (handles
-        captains forgetting to /match report). Promotes any next queue, same as
-        a manual report. Returns the finished game's players, or None if nothing
-        timed out."""
-        if self.phase is not Phase.LIVE or self.live_since is None:
-            return None
-        if self._now() - self.live_since < LIVE_AUTO_REPORT_SECONDS:
-            return None
-        players = list(self.queue.keys())
-        self._end_and_promote()
-        return players
+    def _side_players(self, color):
+        """Everyone on one side: that color's captain (the medic) plus their
+        picks. Captains live in capt_of, picks in team[color], so there's no
+        overlap; the membership guard is just belt-and-suspenders."""
+        members = list(self.team[color])
+        cap = self.capt_of.get(color)
+        if cap is not None and cap not in members:
+            members.insert(0, cap)
+        return members
+
+    def _avg_elo(self, players):
+        if not players:
+            return ELO_START
+        return sum(self._stat_rec(p)["elo"] for p in players) / len(players)
+
+    def _record_result(self, winner):
+        """Apply one reported outcome and return a detail record for the audit log.
+
+        Per-player Elo: each player's expected score is computed against the
+        OPPOSING team's average rating, so within a team a favorite gains less
+        than an underdog. The raw deltas are then renormalized so the winners'
+        total gain equals the losers' total loss (a zero-sum pool, up to integer
+        rounding), and finally each change is clamped to ±ELO_CLAMP as a hard rail
+        so no single game can swing anyone more than that. `winner` is 'RED'/'BLU'.
+        Detail = winner, both rosters, a representative swing, and each player's
+        [before, after] Elo."""
+        red, blu = self._side_players("RED"), self._side_players("BLU")
+        before = {p: self._stat_rec(p)["elo"] for p in red + blu}
+        avg_red, avg_blu = self._avg_elo(red), self._avg_elo(blu)
+        win_side, lose_side = (red, blu) if winner == "RED" else (blu, red)
+
+        def expected(rating, opp_avg):
+            return 1.0 / (1.0 + 10 ** ((opp_avg - rating) / 400.0))
+
+        # raw per-player delta vs the opposing team's average
+        raw = {}
+        for p in red:
+            raw[p] = ELO_K * ((1.0 if winner == "RED" else 0.0) - expected(before[p], avg_blu))
+        for p in blu:
+            raw[p] = ELO_K * ((1.0 if winner == "BLU" else 0.0) - expected(before[p], avg_red))
+
+        # renormalize so total gain == total loss (keeps the pool zero-sum)
+        gain = sum(raw[p] for p in win_side)
+        loss = -sum(raw[p] for p in lose_side)
+        target = (gain + loss) / 2.0
+        if gain > 0:
+            for p in win_side:
+                raw[p] *= target / gain
+        if loss > 0:
+            for p in lose_side:
+                raw[p] *= target / loss
+
+        # clamp each change to the hard rail, then round to an integer rating
+        delta = {p: round(max(-ELO_CLAMP, min(ELO_CLAMP, raw[p]))) for p in raw}
+        for p in red + blu:
+            self._stat_rec(p)["elo"] = before[p] + delta[p]
+
+        for p in win_side:
+            self._stat_rec(p)["w"] += 1
+        for p in lose_side:
+            self._stat_rec(p)["l"] += 1
+
+        swing = round(sum(delta[p] for p in win_side) / len(win_side)) if win_side else 0
+        return {
+            "winner": winner,
+            "delta": swing,        # representative (average) winner swing for the log summary
+            "red": list(red),
+            "blu": list(blu),
+            "elos": {p: [before[p], self._stat_rec(p)["elo"]] for p in red + blu},
+        }
 
     def _apply_immunity(self):
         caps = set(self.capt_of.values())     # whoever actually captained/medded
@@ -461,22 +543,40 @@ class PugState:
         self.captains = [in_uid if x == out_uid else x for x in self.captains]
 
     # ---------- end / cancel / admin ----------
-    def match_report(self, uid, is_admin=False):
-        """Report a LIVE game (captain/admin) OR cancel a forming match (admin).
+    def match_report(self, uid, is_admin=False, winner=None):
+        """Record a finished LIVE game's result (W/L + Elo) and reopen the queue.
+        Valid only while LIVE, and a winner ('RED'/'BLU') is REQUIRED — a captain
+        can't end a game without naming who won. A captain or an admin may report.
+        To end a game with no result, use match_cancel (admin only).
         Returns (ok, msg, players_to_ping)."""
-        if self.phase == Phase.LIVE:
-            if not is_admin and uid not in self.capt_of.values():
-                return False, "Only a captain or admin can report.", []
-            players = list(self.queue.keys())
-            self._end_and_promote()
-            return True, "Game reported. Queue open — /add to join.", players
-        if self.phase in (Phase.READY_CHECK, Phase.PICKING):
-            if not is_admin:
-                return False, "Only admins can cancel a forming match.", []
-            players = list(self.queue.keys())
-            self._end_and_promote()
-            return True, "your match has been canceled.", players
-        return False, "No match to report.", []
+        self.last_result = None
+        if self.phase != Phase.LIVE:
+            return False, "No live game to report.", []
+        if not is_admin and uid not in self.capt_of.values():
+            return False, "Only a captain or admin can report.", []
+        w = (winner or "").upper() or None
+        if w not in ("RED", "BLU"):
+            return False, "Say who won: /match report red or /match report blu.", []
+        players = list(self.queue.keys())
+        self.last_result = self._record_result(w)
+        self._end_and_promote()
+        return True, f"{w} wins — recorded. Queue open — /add to join.", players
+
+    def match_cancel(self, uid, is_admin=False):
+        """Admin: end a match with NO result recorded — void a live game that was
+        abandoned/never really played, or scrap a forming match. Touches nobody's
+        Elo or W/L. Returns (ok, msg, players_to_ping)."""
+        self.last_result = None
+        if not is_admin:
+            return False, "Only admins can cancel a match.", []
+        if self.phase not in (Phase.LIVE, Phase.READY_CHECK, Phase.PICKING):
+            return False, "No match to cancel.", []
+        was_live = self.phase is Phase.LIVE
+        players = list(self.queue.keys())
+        self._end_and_promote()
+        msg = ("Game voided — no result recorded. Queue open — /add to join."
+               if was_live else "your match has been canceled.")
+        return True, msg, players
 
     def _end_and_promote(self):
         """Clear the finished match and promote the next queue into the slot.
@@ -543,6 +643,24 @@ class PugState:
         return True, (f"<@{uid}> med-immunity cleared." if had
                       else f"<@{uid}> had no immunity.")
 
+    # ---------- Elo admin ----------
+    def set_elo(self, uid, value):
+        """Admin: set a player's Elo to an exact value. Returns
+        (ok, msg, before, after) so the caller can write it to the audit log."""
+        rec = self._stat_rec(uid)
+        before = rec["elo"]
+        rec["elo"] = int(value)
+        return True, f"<@{uid}> Elo set to {rec['elo']} (was {before}).", before, rec["elo"]
+
+    def add_elo(self, uid, delta):
+        """Admin: nudge a player's Elo by a (possibly negative) amount. Returns
+        (ok, msg, before, after)."""
+        rec = self._stat_rec(uid)
+        before = rec["elo"]
+        rec["elo"] = before + int(delta)
+        sign = "+" if int(delta) >= 0 else ""
+        return True, f"<@{uid}> Elo {sign}{int(delta)} → {rec['elo']} (was {before}).", before, rec["elo"]
+
     def admin_reset(self):
         """Unstick a frozen pick: same 12 players, re-roll captains."""
         players = dict(self.queue)
@@ -602,7 +720,7 @@ if __name__ == "__main__":
     print("A) all auto-ready -> draft -> 6v6, meds immune x2")
 
     # match_report by captain ends the live game
-    ok, msg, pinged = s.match_report(caps[0])
+    ok, msg, pinged = s.match_report(caps[0], winner="red")
     assert ok and s.phase is Phase.IDLE and len(pinged) == 12
     print("   captain /match report ends live game, pings 12")
 
@@ -635,11 +753,11 @@ if __name__ == "__main__":
     print("C) last ready-up completes check -> draft")
 
     # D) admin cancel mid-pick; non-admin blocked
-    ok, _, _ = s.match_report(99999, is_admin=False)
+    ok, _, _ = s.match_cancel(99999, is_admin=False)
     assert ok is False
-    ok, msg, pinged = s.match_report(99999, is_admin=True)
+    ok, msg, pinged = s.match_cancel(99999, is_admin=True)
     assert ok and "canceled" in msg and len(pinged) == 12 and s.phase is Phase.IDLE
-    print("D) admin /match report cancels mid-pick; non-admin blocked")
+    print("D) admin /match cancel scraps a forming match; non-admin blocked")
 
     # E) auto-ready cap at 30 min
     clock["t"] = 0.0
@@ -759,7 +877,7 @@ if __name__ == "__main__":
     assert s.add(102)[0] is True and 102 in s.next_queue
     assert s.add(P[0])[0] is False                              # active player can't double-queue
     assert len(s.queue) == 12 and len(s.next_queue) == 2
-    ok, msg, pinged = s.match_report(caps[0])                   # captain ends the game
+    ok, msg, pinged = s.match_report(caps[0], winner="red")    # captain ends the game
     assert ok and len(pinged) == 12
     assert s.phase is Phase.QUEUING                             # next queue promoted
     assert set(s.queue) == {101, 102} and not s.next_queue
@@ -771,7 +889,7 @@ if __name__ == "__main__":
     for x in range(101, 113):                                   # 12 fresh players -> next queue
         s.add(x)
     assert len(s.next_queue) == 12
-    ok, _, _ = s.match_report(caps[0])
+    ok, _, _ = s.match_report(caps[0], winner="red")
     assert s.phase in (Phase.READY_CHECK, Phase.PICKING)        # promoted full -> straight into it
     assert set(s.queue) == set(range(101, 113))
     print("O) a full next queue starts its ready check on promotion")
@@ -801,7 +919,7 @@ if __name__ == "__main__":
     assert s2.team == s.team and s2.capt_of == s.capt_of
     assert s2.immunity == s.immunity
     assert s2.turn_idx == s.turn_idx and s2.picks_left == s.picks_left
-    ok, _, pinged = s2.match_report(caps[0])                  # restored captain can still report
+    ok, _, pinged = s2.match_report(caps[0], winner="red")    # restored captain can still report
     assert ok and set(s2.queue) == {101, 102, 103}            # next queue promoted after reload
     print("Q) full state round-trips through JSON and stays functional")
 
@@ -816,7 +934,7 @@ if __name__ == "__main__":
     assert s.queue_ids() == live_players                      # same 12 still playing
     assert s.next_queue_ids() == []                           # next queue wiped
     # with no game running, /clear wipes the active queue as before
-    s.match_report(caps[0])                                   # ends game; next queue empty -> IDLE
+    s.match_report(caps[0], winner="red")                     # ends game; next queue empty -> IDLE
     s.add(301); s.add(302)
     assert s.phase is Phase.QUEUING
     s.admin_clear()
@@ -853,20 +971,18 @@ if __name__ == "__main__":
     assert ok and s.phase is Phase.PICKING             # completes the check -> draft
     print("T) arming auto-ready during a ready check confirms the player (and completes it when last)")
 
-    # U) a live game auto-ends after the report window (captains forgot)
+    # U) a live game never auto-ends — it stays LIVE until a human reports.
+    #    (The old 50-min auto-void was removed; only a report/cancel ends a game.)
     clock["t"] = 13000.0
     s = fresh(); fill(s, P); caps = drive_draft(s)        # LIVE
-    for x in (201, 202): s.add(x)                          # next queue waiting
-    assert s.check_live_timeout() is None                  # not time yet
-    clock["t"] = 13000.0 + LIVE_AUTO_REPORT_SECONDS - 1
-    assert s.check_live_timeout() is None                  # still under the limit
-    clock["t"] = 13000.0 + LIVE_AUTO_REPORT_SECONDS + 1
-    finished = s.check_live_timeout()
-    assert finished is not None and len(finished) == 12    # the 12 who were playing
-    assert set(s.queue) == {201, 202}                       # next queue promoted
-    assert s.live_since is None                             # clock reset
-    assert s.check_live_timeout() is None                   # idempotent (no longer LIVE)
-    print("U) live games auto-report after the time limit and promote the next queue")
+    assert not hasattr(s, "check_live_timeout")            # the auto-end is gone
+    clock["t"] = 13000.0 + 10 * 60 * 60                    # 10 hours later
+    s.sweep_timeouts()                                     # the only remaining background sweep
+    assert s.phase is Phase.LIVE                            # still live — no timer can end it
+    assert set(s.queue) == set(P)
+    ok, _, _ = s.match_report(caps[0], winner="red")        # a real report is the only way out
+    assert ok and s.phase is Phase.IDLE
+    print("U) a live game never auto-ends; only a captain/admin report ends it")
 
     # V) failed ready check never overflows the active queue past 12.
     #    12 queued + 6 waiting in next queue; 2 fail to ready. The 2 are dropped,
@@ -903,7 +1019,7 @@ if __name__ == "__main__":
     assert all(shared_stats[p]["games"] == 1 for p in P), shared_stats
     assert shared_stats[caps[0]]["capt"] == 1 and shared_stats[caps[1]]["capt"] == 1
     assert sum(r["capt"] for r in shared_stats.values()) == 2   # exactly 2 captains counted
-    s.match_report(caps[0])
+    s.match_report(caps[0], winner="red")
     # a SECOND lobby sharing the same dict adds to the same totals
     s2 = PugState(now=NOW, stats=shared_stats); fill(s2, P)
     caps2 = drive_draft(s2)
@@ -928,5 +1044,118 @@ if __name__ == "__main__":
     ok, msg = s.match_put(blu_cap, "red")
     assert ok and "BLU" not in s.capt_of and blu_cap in s.team["RED"], (msg, s.capt_of)
     print("X) match_put assigns/bumps captains and frees slots")
+
+    # Y) reporting a winner records W/L + Elo (zero-sum); a captain must name a
+    #    winner to report.
+    clock["t"] = 1000.0
+    st = {}
+    s = PugState(now=NOW, stats=st); fill(s, P)
+    caps = drive_draft(s)                              # LIVE, all 12 at base Elo
+    red, blu = s._side_players("RED"), s._side_players("BLU")
+    assert len(red) == 6 and len(blu) == 6 and not (set(red) & set(blu))
+    ok, _, _ = s.match_report(caps[0])                 # captain, no winner -> refused
+    assert ok is False and s.phase is Phase.LIVE
+    ok, msg, players = s.match_report(caps[0], winner="red")
+    assert ok and len(players) == 12
+    for p in red:
+        assert st[p]["w"] == 1 and st[p]["l"] == 0 and st[p]["elo"] == ELO_START + 16
+    for p in blu:
+        assert st[p]["l"] == 1 and st[p]["w"] == 0 and st[p]["elo"] == ELO_START - 16
+    assert sum(st[p]["elo"] for p in P) == ELO_START * 12        # Elo is zero-sum
+    print("Y) a declared winner records W/L + zero-sum Elo; captain must name one")
+
+    # Y2) an admin can void a live game (match_cancel) — ends it, records NOTHING,
+    #     though the game still counts as 'played' (bumped at go-live).
+    clock["t"] = 2000.0
+    st2 = {}
+    s = PugState(now=NOW, stats=st2); fill(s, P)
+    drive_draft(s)
+    assert s.phase is Phase.LIVE
+    ok, msg, players = s.match_cancel(0, is_admin=True)          # admin void of a live game
+    assert ok and "void" in msg.lower() and len(players) == 12
+    assert all(st2[p]["w"] == 0 and st2[p]["l"] == 0 for p in P)
+    assert all(st2[p]["elo"] == ELO_START for p in P)
+    assert all(st2[p]["games"] == 1 for p in P)                  # void still 'played'
+    print("Y2) an admin void (match_cancel) ends the game and records no W/L or Elo")
+
+    # Z) records saved before the w/l/elo keys existed upgrade in place the first
+    #    time they're touched — so an existing pug.db needs no migration or wipe.
+    st_old = {7: {"games": 5, "capt": 2}}                        # legacy record shape
+    s = PugState(now=NOW, stats=st_old)
+    rec = s._stat_rec(7)
+    assert rec["games"] == 5 and rec["capt"] == 2                # history preserved
+    assert rec["w"] == 0 and rec["l"] == 0 and rec["elo"] == ELO_START  # back-filled
+    print("Z) legacy stat records upgrade in place (no DB wipe needed)")
+
+    # AA) match_report exposes a detail record (for the audit log) on a recorded
+    #     game, leaves it None on a void, and never leaks into the snapshot;
+    #     admin set/add Elo report before/after for logging.
+    clock["t"] = 1000.0
+    st = {}
+    s = PugState(now=NOW, stats=st); fill(s, P)
+    caps = drive_draft(s)
+    red, blu = s._side_players("RED"), s._side_players("BLU")
+    s.match_report(caps[0], winner="blu")
+    det = s.last_result
+    assert det is not None
+    assert det["winner"] == "BLU" and det["delta"] == 16
+    assert set(det["red"]) == set(red) and set(det["blu"]) == set(blu)
+    assert len(det["elos"]) == 12
+    # every blu player's record shows [1000, 1016]; red [1000, 984]
+    assert all(det["elos"][p] == [ELO_START, ELO_START + 16] for p in blu)
+    assert all(det["elos"][p] == [ELO_START, ELO_START - 16] for p in red)
+    assert "last_result" not in s.to_dict()                     # transient, never persisted
+    # a void leaves no detail
+    clock["t"] = 2000.0
+    s2 = PugState(now=NOW, stats={}); fill(s2, P); drive_draft(s2)
+    s2.match_cancel(0, is_admin=True)                           # void
+    assert s2.last_result is None
+    # admin Elo edits report before/after
+    ok, msg, before, after = s.set_elo(blu[0], 1234)
+    assert ok and before == ELO_START + 16 and after == 1234
+    ok, msg, before, after = s.add_elo(blu[0], -34)
+    assert ok and before == 1234 and after == 1200
+    print("AA) report yields an audit detail (None on void); admin set/add Elo report before/after")
+
+    # BB) per-player Elo: within a team, a higher-rated player moves less than a
+    #     lower-rated one; the result renormalizes to ~zero-sum; all moves clamp ±20.
+    st = {}
+    s = PugState(now=NOW, stats=st)
+    ratings = {1: 1600, 2: 1600, 3: 1600,      # RED (will lose)
+               4: 1500, 5: 1600, 6: 1700}      # BLU (will win) — spread within the team
+    for u, r in ratings.items():
+        st[u] = {"games": 1, "capt": 0, "w": 0, "l": 0, "elo": r}
+    s.phase = Phase.LIVE
+    s.capt_of = {"RED": 1, "BLU": 4}
+    s.team = {"RED": [2, 3], "BLU": [5, 6]}
+    s.queue = {u: 0 for u in ratings}
+    det = s._record_result("BLU")                                # BLU wins
+    gain = {u: st[u]["elo"] - ratings[u] for u in (4, 5, 6)}
+    # within the winning team, the lowest-rated (4=1500) gains most, the highest (6) least
+    assert gain[4] > gain[5] > gain[6], gain
+    # every move is within the clamp
+    assert all(abs(st[u]["elo"] - ratings[u]) <= ELO_CLAMP for u in ratings)
+    # ~zero-sum across the match (within integer rounding)
+    won = sum(st[u]["elo"] - ratings[u] for u in (4, 5, 6))
+    lost = sum(ratings[u] - st[u]["elo"] for u in (1, 2, 3))
+    assert abs(won - lost) <= 2, (won, lost)
+    assert all(st[u]["w"] == 1 for u in (4, 5, 6)) and all(st[u]["l"] == 1 for u in (1, 2, 3))
+    print("BB) per-player Elo varies by own rating, renormalizes ~zero-sum, clamps ±20")
+
+    # BB2) a lopsided result is held to the clamp even when raw deltas blow past it
+    st = {}
+    s = PugState(now=NOW, stats=st)
+    for u in (1, 2, 3):
+        st[u] = {"games": 1, "capt": 0, "w": 0, "l": 0, "elo": 1900}   # strong RED
+    for u in (4, 5, 6):
+        st[u] = {"games": 1, "capt": 0, "w": 0, "l": 0, "elo": 1300}   # weak BLU
+    s.phase = Phase.LIVE
+    s.capt_of = {"RED": 1, "BLU": 4}
+    s.team = {"RED": [2, 3], "BLU": [5, 6]}
+    s.queue = {u: 0 for u in range(1, 7)}
+    s._record_result("BLU")                                      # big upset
+    assert all(st[u]["elo"] == 1300 + ELO_CLAMP for u in (4, 5, 6))   # +20 exactly
+    assert all(st[u]["elo"] == 1900 - ELO_CLAMP for u in (1, 2, 3))   # -20 exactly
+    print("BB2) a blowout upset is capped at exactly ±20")
 
     print("\nall smoke tests passed.")
