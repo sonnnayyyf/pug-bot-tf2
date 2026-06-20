@@ -92,7 +92,7 @@ from lobby import reconcile, blocking_cid
 
 # ---------- lobby registry (one independent game per configured channel) ----------
 SHARED_IMMUNITY = {}             # med immunity is shared across lobbies (per-player)
-SHARED_STATS = {}                # lifetime {uid: {"games","capt","w","l","elo"}}, shared across lobbies
+SHARED_STATS = {}                # lifetime {uid: {"games","capt","w","l","d","elo"}}, shared across lobbies
 _SINGLE = None                   # lobby key used when no channels are configured
 lobbies = {}                     # lobby_key -> PugState
 _ready_views = {}                # lobby_key -> ReadyView | None
@@ -420,9 +420,13 @@ def results_embed(guild, mid, detail) -> discord.Embed:
 
     colors = {"RED": discord.Color.red(), "BLU": discord.Color.blue()}
     head = f"Match #{mid} — " if mid is not None else ""
-    embed = discord.Embed(title=f"{head}{winner} win 🏆",
-                          color=colors.get(winner, discord.Color.green()))
-    order = ("RED", "BLU") if winner == "RED" else ("BLU", "RED")   # winner on top
+    if winner == "DRAW":
+        embed = discord.Embed(title=f"{head}Draw 🤝", color=discord.Color.greyple())
+        order = ("RED", "BLU")
+    else:
+        embed = discord.Embed(title=f"{head}{winner} win 🏆",
+                              color=colors.get(winner, discord.Color.green()))
+        order = ("RED", "BLU") if winner == "RED" else ("BLU", "RED")   # winner on top
     for side in order:
         trophy = "  🏆" if side == winner else ""
         embed.add_field(name=f"{dots[side]} {side}{trophy}", value=field(side), inline=False)
@@ -874,11 +878,12 @@ async def subfor_cmd(interaction: discord.Interaction, player: Optional[discord.
 match_group = app_commands.Group(name="match", description="Match controls.")
 
 
-@match_group.command(name="report", description="Report the winner of the live game (captain or admin).")
-@app_commands.describe(winner="Which team won")
+@match_group.command(name="report", description="Report the result of the live game (captain or admin).")
+@app_commands.describe(winner="Which team won, or draw")
 @app_commands.choices(winner=[
     app_commands.Choice(name="RED win", value="red"),
     app_commands.Choice(name="BLU win", value="blu"),
+    app_commands.Choice(name="Draw / Tie", value="draw"),
 ])
 async def match_report_cmd(interaction: discord.Interaction,
                            winner: app_commands.Choice[str]):
@@ -960,8 +965,9 @@ async def match_log_cmd(interaction: discord.Interaction):
     for e in events:
         d = e["data"]
         win = d.get("winner", "?")
-        dot = "🔴" if win == "RED" else "🔵"
-        lines.append(f"**#{e['id']}** {dot} {win} win · Δ{d.get('delta', 0)} · "
+        dot = {"RED": "🔴", "BLU": "🔵"}.get(win, "🤝")
+        label = "Draw" if win == "DRAW" else f"{win} win"
+        lines.append(f"**#{e['id']}** {dot} {label} · Δ{d.get('delta', 0)} · "
                      f"{_ago(e['ts'])}")
     await interaction.response.send_message(
         "🗒️ **Recent matches** (use `/match info <id>` for detail)\n" + "\n".join(lines))
@@ -975,7 +981,6 @@ async def match_info_cmd(interaction: discord.Interaction, match_id: int):
         await interaction.response.send_message(f"No match #{match_id}.", ephemeral=True)
         return
     d = e["data"]
-    dot = {"RED": "🔴", "BLU": "🔵"}
     elos = d.get("elos", {})
 
     def side(color):
@@ -990,11 +995,59 @@ async def match_info_cmd(interaction: discord.Interaction, match_id: int):
         return ", ".join(out) or "—"
 
     win = d.get("winner", "?")
-    lines = [f"**Match #{e['id']}** · {dot.get(win, '')} **{win} win** · "
+    dot = {"RED": "🔴", "BLU": "🔵", "DRAW": "🤝"}
+    label = "**Draw**" if win == "DRAW" else f"**{win} win**"
+    lines = [f"**Match #{e['id']}** · {dot.get(win, '')} {label} · "
              f"swing Δ{d.get('delta', 0)} · {_ago(e['ts'])}",
              f"🔴 RED: {side('RED')}",
              f"🔵 BLU: {side('BLU')}"]
     await interaction.response.send_message("\n".join(lines))
+
+
+@match_group.command(name="fix", description="Admin: correct a misreported match (auto-recomputes everyone's Elo + W/L/D).")
+@app_commands.describe(match_id="The match number (see /match log)", result="The correct result")
+@app_commands.choices(result=[
+    app_commands.Choice(name="RED win", value="red"),
+    app_commands.Choice(name="BLU win", value="blu"),
+    app_commands.Choice(name="Draw / Tie", value="draw"),
+])
+async def match_fix_cmd(interaction: discord.Interaction,
+                        match_id: int, result: app_commands.Choice[str]):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    e = store.get_event(match_id)
+    if e is None or e.get("kind") != "match":
+        await interaction.response.send_message(f"No match #{match_id}.", ephemeral=True)
+        return
+    d = e["data"]
+    old_winner = d.get("winner")
+    new_winner = result.value.upper()
+    if new_winner == old_winner:
+        label = "a draw" if old_winner == "DRAW" else f"a {old_winner} win"
+        await interaction.response.send_message(
+            f"Match #{match_id} is already recorded as {label}.", ephemeral=True)
+        return
+    elos = d.get("elos", {})
+    red = [int(u) for u in d.get("red", [])]
+    blu = [int(u) for u in d.get("blu", [])]
+    before = {}
+    for u in red + blu:
+        ba = elos.get(str(u)) or elos.get(u)
+        if not ba:
+            await interaction.response.send_message(
+                f"Match #{match_id} is missing rating data — can't auto-fix.", ephemeral=True)
+            return
+        before[u] = ba[0]
+    detail = pug.correct_match(red, blu, before, old_winner, new_winner)
+    store.log_event("correction", {"match_id": match_id, "from": old_winner,
+                                   "to": new_winner, "by": interaction.user.id})
+    embed = results_embed(interaction.guild, match_id, detail)
+    was = "Draw" if old_winner == "DRAW" else f"{old_winner} win"
+    now = "Draw" if new_winner == "DRAW" else f"{new_winner} win"
+    embed.title = f"Match #{match_id} corrected — {now} (was {was})"
+    embed.set_footer(text="Elo and W/L/D updated automatically.")
+    await interaction.response.send_message(embed=embed)
 
 
 client.tree.add_command(match_group)
@@ -1138,7 +1191,7 @@ async def stat_cmd(interaction: discord.Interaction, player: Optional[discord.Me
         await interaction.response.send_message(embed=empty)
         return
     c = rec.get("capt", 0)
-    w, l = rec.get("w", 0), rec.get("l", 0)
+    w, l, dr = rec.get("w", 0), rec.get("l", 0), rec.get("d", 0)
     elo = rec.get("elo", ELO_START)
     decided = w + l
     wr = f"{round(100 * w / decided)}%" if decided else "—"
@@ -1158,7 +1211,7 @@ async def stat_cmd(interaction: discord.Interaction, player: Optional[discord.Me
     if member.id not in FAKE_NAMES:
         embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="Elo", value=f"**{elo}**", inline=True)
-    embed.add_field(name="Record", value=f"{w}W – {l}L", inline=True)
+    embed.add_field(name="Record", value=f"{w}W – {l}L – {dr}D", inline=True)
     embed.add_field(name="Win rate", value=wr, inline=True)
     embed.add_field(name="Games", value=str(g), inline=True)
     embed.add_field(name="Captain", value=capt_val, inline=True)
@@ -1282,9 +1335,10 @@ async def commands_cmd(interaction: discord.Interaction):
         "`/capfor red|blu` — volunteer to captain · `/capoff` — step down\n"
         "`/pick @user` — draft a player\n"
         "`/subme` — request a sub · `/subfor` — sub in (draft stage)\n"
-        "`/match report red|blu` — report the winner of the live game (captain/admin)\n"
+        "`/match report red|blu|draw` — report the result of the live game (captain/admin)\n"
         "`/match cancel` — admin: end a match with no result (void a live game or scrap a forming one)\n"
         "`/match log` · `/match info <id>` — browse recorded matches\n"
+        "`/match fix <id> red|blu|draw` — admin: correct a misreported match\n"
         "`/match put @player red|blu|capt red|capt blu|bench` — admin: move a player to a team, a captain slot, or the bench\n"
         "`/match start` — admin: force a fully-set draft to go live\n"
         "`/immunity show|set|add|clear` — admin: manage med immunity\n"
