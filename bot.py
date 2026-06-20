@@ -938,6 +938,18 @@ async def match_put_cmd(interaction: discord.Interaction,
     await interaction.response.send_message(embed=embed)
 
 
+@match_group.command(name="start", description="Admin: force a fully-set draft to go live (e.g. after arranging teams with /match put).")
+async def match_start_cmd(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    ok, msg = pug.match_start(interaction.user.id, is_admin=True)
+    if not ok:
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+    await interaction.response.send_message(embed=final_embed(interaction.guild))
+
+
 @match_group.command(name="log", description="Show the most recent reported matches.")
 async def match_log_cmd(interaction: discord.Interaction):
     events = store.recent_events(limit=10, kind="match")
@@ -1274,6 +1286,7 @@ async def commands_cmd(interaction: discord.Interaction):
         "`/match cancel` — admin: end a match with no result (void a live game or scrap a forming one)\n"
         "`/match log` · `/match info <id>` — browse recorded matches\n"
         "`/match put @player red|blu|capt red|capt blu|bench` — admin: move a player to a team, a captain slot, or the bench\n"
+        "`/match start` — admin: force a fully-set draft to go live\n"
         "`/immunity show|set|add|clear` — admin: manage med immunity\n"
         "`/elo set|add @player` — admin: correct a rating\n"
         "`/reset` · `/clear` · `/forceadd` — admin\n"
