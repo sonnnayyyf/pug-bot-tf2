@@ -363,6 +363,32 @@ class PugState:
             else:
                 self.picks_left = PICK_ORDER[self.turn_idx][1]
 
+    def _draft_full(self):
+        """True when both captains are set and every slot is filled (6v6) — the
+        condition for a draft to go live, no matter how it got filled (normal
+        /pick order or manual /match put)."""
+        half = QUEUE_SIZE // 2
+        return (self._both_capts_set and not self.unpicked()
+                and len(self._side_players("RED")) == half
+                and len(self._side_players("BLU")) == half)
+
+    def _settle_draft(self):
+        """After a manual team change during PICKING (e.g. /match put), assign a
+        forced last player when only one slot is open, then go live once the teams
+        are full. No-op outside PICKING, with a missing captain, or mid-draft —
+        so a partial change just leaves the draft running."""
+        if self.phase is not Phase.PICKING or not self._both_capts_set:
+            return
+        half = QUEUE_SIZE // 2
+        rem = self.unpicked()
+        if len(rem) == 1:                       # exactly one open slot -> forced
+            if len(self._side_players("RED")) < half:
+                self.team["RED"].append(rem[0])
+            elif len(self._side_players("BLU")) < half:
+                self.team["BLU"].append(rem[0])
+        if self._draft_full():
+            self._go_live()
+
     def pick(self, uid, target):
         if self.phase != Phase.PICKING:
             return False, "Not in picking phase."
@@ -616,12 +642,34 @@ class PugState:
             self.capt_of[color] = uid
             dnote = (f" <@{displaced}> is now unpicked." if displaced and displaced != uid
                      else "")
-            return True, f"Made <@{uid}> {color} captain{note}.{dnote}"
-        if where == "BENCH":
-            return True, f"Moved <@{uid}> to the bench{note}."
-        if uid not in self.team[where]:
-            self.team[where].append(uid)
-        return True, f"Moved <@{uid}> to {where}{note}."
+            msg = f"Made <@{uid}> {color} captain{note}.{dnote}"
+        elif where == "BENCH":
+            msg = f"Moved <@{uid}> to the bench{note}."
+        else:
+            if uid not in self.team[where]:
+                self.team[where].append(uid)
+            msg = f"Moved <@{uid}> to {where}{note}."
+        # a /match put can complete the draft; if the teams are now full, go live
+        if self.phase is Phase.PICKING:
+            self._settle_draft()
+            if self.phase is Phase.LIVE:
+                msg += " Teams full — match is now live. GLHF!"
+        return True, msg
+
+    def match_start(self, uid, is_admin=False):
+        """Admin: force a fully-set PICKING draft to go live — e.g. after the teams
+        were arranged by hand with /match put. Only works once both teams are full
+        6v6; otherwise it says what's still missing."""
+        if not is_admin:
+            return False, "Only admins can start the match."
+        if self.phase is not Phase.PICKING:
+            return False, "No draft waiting to start."
+        self._settle_draft()
+        if self.phase is Phase.LIVE:
+            return True, "Teams set — match is now live. GLHF!"
+        half = QUEUE_SIZE // 2
+        return False, (f"Teams aren't full yet — RED {len(self._side_players('RED'))}/{half}, "
+                       f"BLU {len(self._side_players('BLU'))}/{half}. Fill them with /match put first.")
 
     # ---------- immunity admin ----------
     def immunity_list(self):
@@ -1157,5 +1205,43 @@ if __name__ == "__main__":
     assert all(st[u]["elo"] == 1300 + ELO_CLAMP for u in (4, 5, 6))   # +20 exactly
     assert all(st[u]["elo"] == 1900 - ELO_CLAMP for u in (1, 2, 3))   # -20 exactly
     print("BB2) a blowout upset is capped at exactly ±20")
+
+    # CC) filling teams with /match put completes the draft and goes live (the bug
+    #     was that manual puts never tripped the go-live transition).
+    clock["t"] = 1000.0
+    s = fresh(); fill(s, P)
+    assert s.phase is Phase.PICKING
+    caps = list(s.captains)
+    s.capfor(caps[0], "red"); s.capfor(caps[1], "blu")
+    others = [u for u in P if u not in caps]
+    for i, u in enumerate(others):
+        ok, _ = s.match_put(u, "red" if i % 2 == 0 else "blu")
+        assert ok
+    half = QUEUE_SIZE // 2
+    assert s.phase is Phase.LIVE, (s.phase, len(s.unpicked()))
+    assert len(s._side_players("RED")) == half and len(s._side_players("BLU")) == half
+    print("CC) filling teams with /match put completes the draft and goes live")
+
+    # CC2) /match start force-lives a full draft that's somehow still in PICKING
+    #      (admin only), and refuses an unfilled one.
+    s = fresh(); fill(s, P)
+    caps = list(s.captains)
+    s.capfor(caps[0], "red"); s.capfor(caps[1], "blu")
+    others = [u for u in P if u not in caps]
+    for i, u in enumerate(others):                  # hand-place all 10 WITHOUT settling
+        (s.team["RED"] if i < 5 else s.team["BLU"]).append(u)
+    s.phase = Phase.PICKING                          # simulate the stuck state
+    assert not s.unpicked()
+    assert s.match_start(0, is_admin=False)[0] is False and s.phase is Phase.PICKING   # non-admin
+    ok, msg = s.match_start(0, is_admin=True)
+    assert ok and s.phase is Phase.LIVE
+    # an unfilled draft is refused
+    s = fresh(); fill(s, P)
+    caps = list(s.captains)
+    s.capfor(caps[0], "red"); s.capfor(caps[1], "blu")
+    s.match_put(next(u for u in P if u not in caps), "red")   # one pick only
+    ok, msg = s.match_start(0, is_admin=True)
+    assert ok is False and "full" in msg.lower() and s.phase is Phase.PICKING
+    print("CC2) /match start force-lives a stuck full draft (admin only); refuses a partial one")
 
     print("\nall smoke tests passed.")
