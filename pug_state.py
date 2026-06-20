@@ -435,6 +435,7 @@ class PugState:
         rec.setdefault("capt", 0)
         rec.setdefault("w", 0)
         rec.setdefault("l", 0)
+        rec.setdefault("d", 0)
         rec.setdefault("elo", ELO_START)
         return rec
 
@@ -463,60 +464,100 @@ class PugState:
             return ELO_START
         return sum(self._stat_rec(p)["elo"] for p in players) / len(players)
 
-    def _record_result(self, winner):
-        """Apply one reported outcome and return a detail record for the audit log.
-
-        Per-player Elo: each player's expected score is computed against the
-        OPPOSING team's average rating, so within a team a favorite gains less
-        than an underdog. The raw deltas are then renormalized so the winners'
-        total gain equals the losers' total loss (a zero-sum pool, up to integer
-        rounding), and finally each change is clamped to ±ELO_CLAMP as a hard rail
-        so no single game can swing anyone more than that. `winner` is 'RED'/'BLU'.
-        Detail = winner, both rosters, a representative swing, and each player's
-        [before, after] Elo."""
-        red, blu = self._side_players("RED"), self._side_players("BLU")
-        before = {p: self._stat_rec(p)["elo"] for p in red + blu}
-        avg_red, avg_blu = self._avg_elo(red), self._avg_elo(blu)
-        win_side, lose_side = (red, blu) if winner == "RED" else (blu, red)
+    def _compute_deltas(self, red, blu, before, winner):
+        """Pure: given rosters, each player's before-rating, and the result
+        ('RED'/'BLU'/'DRAW'), return {uid: integer delta} after the per-player
+        expectation, zero-sum renormalization, and ±ELO_CLAMP clamp. No state
+        is read or written, so it's reusable for both live results and after-the-
+        fact corrections."""
+        avg_red = sum(before[p] for p in red) / len(red) if red else ELO_START
+        avg_blu = sum(before[p] for p in blu) / len(blu) if blu else ELO_START
 
         def expected(rating, opp_avg):
             return 1.0 / (1.0 + 10 ** ((opp_avg - rating) / 400.0))
 
-        # raw per-player delta vs the opposing team's average
+        def actual(side):
+            if winner == "DRAW":
+                return 0.5
+            return 1.0 if winner == side else 0.0
+
         raw = {}
         for p in red:
-            raw[p] = ELO_K * ((1.0 if winner == "RED" else 0.0) - expected(before[p], avg_blu))
+            raw[p] = ELO_K * (actual("RED") - expected(before[p], avg_blu))
         for p in blu:
-            raw[p] = ELO_K * ((1.0 if winner == "BLU" else 0.0) - expected(before[p], avg_red))
+            raw[p] = ELO_K * (actual("BLU") - expected(before[p], avg_red))
 
-        # renormalize so total gain == total loss (keeps the pool zero-sum)
-        gain = sum(raw[p] for p in win_side)
-        loss = -sum(raw[p] for p in lose_side)
-        target = (gain + loss) / 2.0
-        if gain > 0:
+        gainers = [p for p in raw if raw[p] > 0]
+        losers = [p for p in raw if raw[p] < 0]
+        pos = sum(raw[p] for p in gainers)
+        neg = -sum(raw[p] for p in losers)
+        target = (pos + neg) / 2.0
+        if pos > 0:
+            for p in gainers:
+                raw[p] *= target / pos
+        if neg > 0:
+            for p in losers:
+                raw[p] *= target / neg
+        return {p: round(max(-ELO_CLAMP, min(ELO_CLAMP, raw[p]))) for p in raw}
+
+    def _apply_record_counts(self, red, blu, winner, sign):
+        """Add `sign` (+1 to record, -1 to undo) to the W/L/D counters for one
+        result. Counters never go below zero."""
+        def bump(uid, key):
+            rec = self._stat_rec(uid)
+            rec[key] = max(0, rec[key] + sign)
+        if winner == "DRAW":
+            for p in red + blu:
+                bump(p, "d")
+        else:
+            win_side, lose_side = (red, blu) if winner == "RED" else (blu, red)
             for p in win_side:
-                raw[p] *= target / gain
-        if loss > 0:
+                bump(p, "w")
             for p in lose_side:
-                raw[p] *= target / loss
+                bump(p, "l")
 
-        # clamp each change to the hard rail, then round to an integer rating
-        delta = {p: round(max(-ELO_CLAMP, min(ELO_CLAMP, raw[p]))) for p in raw}
+    @staticmethod
+    def _swing(deltas):
+        moved = [abs(v) for v in deltas.values() if v != 0]
+        return round(sum(moved) / len(moved)) if moved else 0
+
+    def _record_result(self, winner):
+        """Apply one reported outcome ('RED'/'BLU'/'DRAW') and return a detail
+        record for the audit log: winner, both rosters, a representative swing,
+        and each player's [before, after] Elo."""
+        red, blu = self._side_players("RED"), self._side_players("BLU")
+        before = {p: self._stat_rec(p)["elo"] for p in red + blu}
+        delta = self._compute_deltas(red, blu, before, winner)
         for p in red + blu:
             self._stat_rec(p)["elo"] = before[p] + delta[p]
-
-        for p in win_side:
-            self._stat_rec(p)["w"] += 1
-        for p in lose_side:
-            self._stat_rec(p)["l"] += 1
-
-        swing = round(sum(delta[p] for p in win_side) / len(win_side)) if win_side else 0
+        self._apply_record_counts(red, blu, winner, +1)
         return {
             "winner": winner,
-            "delta": swing,        # representative (average) winner swing for the log summary
+            "delta": self._swing(delta),
             "red": list(red),
             "blu": list(blu),
             "elos": {p: [before[p], self._stat_rec(p)["elo"]] for p in red + blu},
+        }
+
+    def correct_match(self, red, blu, before, old_winner, new_winner):
+        """Re-grade a previously-recorded match: undo the old result and apply the
+        new one, using the ratings as they were AT MATCH TIME (from the audit
+        log), so admins never hand-compute corrections. Adjusts each player's
+        current Elo by the difference and fixes their W/L/D. Returns the corrected
+        detail dict for re-logging."""
+        old = self._compute_deltas(red, blu, before, old_winner)
+        new = self._compute_deltas(red, blu, before, new_winner)
+        for p in red + blu:
+            self._stat_rec(p)["elo"] += new.get(p, 0) - old.get(p, 0)
+        self._apply_record_counts(red, blu, old_winner, -1)
+        self._apply_record_counts(red, blu, new_winner, +1)
+        return {
+            "winner": new_winner,
+            "delta": self._swing(new),
+            "red": list(red),
+            "blu": list(blu),
+            "elos": {p: [before[p], before[p] + new.get(p, 0)] for p in red + blu},
+            "corrected_from": old_winner,
         }
 
     def _apply_immunity(self):
@@ -570,10 +611,10 @@ class PugState:
 
     # ---------- end / cancel / admin ----------
     def match_report(self, uid, is_admin=False, winner=None):
-        """Record a finished LIVE game's result (W/L + Elo) and reopen the queue.
-        Valid only while LIVE, and a winner ('RED'/'BLU') is REQUIRED — a captain
-        can't end a game without naming who won. A captain or an admin may report.
-        To end a game with no result, use match_cancel (admin only).
+        """Record a finished LIVE game's result (W/L/D + Elo) and reopen the queue.
+        Valid only while LIVE, and an outcome ('RED'/'BLU'/'DRAW') is REQUIRED — a
+        captain can't end a game without naming the result. A captain or an admin
+        may report. To end a game with no result, use match_cancel (admin only).
         Returns (ok, msg, players_to_ping)."""
         self.last_result = None
         if self.phase != Phase.LIVE:
@@ -581,11 +622,13 @@ class PugState:
         if not is_admin and uid not in self.capt_of.values():
             return False, "Only a captain or admin can report.", []
         w = (winner or "").upper() or None
-        if w not in ("RED", "BLU"):
-            return False, "Say who won: /match report red or /match report blu.", []
+        if w not in ("RED", "BLU", "DRAW"):
+            return False, "Say who won: /match report red, blu, or draw.", []
         players = list(self.queue.keys())
         self.last_result = self._record_result(w)
         self._end_and_promote()
+        if w == "DRAW":
+            return True, "Draw — recorded. Queue open — /add to join.", players
         return True, f"{w} wins — recorded. Queue open — /add to join.", players
 
     def match_cancel(self, uid, is_admin=False):
@@ -1132,7 +1175,7 @@ if __name__ == "__main__":
     s = PugState(now=NOW, stats=st_old)
     rec = s._stat_rec(7)
     assert rec["games"] == 5 and rec["capt"] == 2                # history preserved
-    assert rec["w"] == 0 and rec["l"] == 0 and rec["elo"] == ELO_START  # back-filled
+    assert rec["w"] == 0 and rec["l"] == 0 and rec["d"] == 0 and rec["elo"] == ELO_START  # back-filled
     print("Z) legacy stat records upgrade in place (no DB wipe needed)")
 
     # AA) match_report exposes a detail record (for the audit log) on a recorded
@@ -1243,5 +1286,66 @@ if __name__ == "__main__":
     ok, msg = s.match_start(0, is_admin=True)
     assert ok is False and "full" in msg.lower() and s.phase is Phase.PICKING
     print("CC2) /match start force-lives a stuck full draft (admin only); refuses a partial one")
+
+    # DD) a draw: balanced teams don't move; unbalanced teams converge; everyone
+    #     gets a draw, nobody a W or L.
+    st = {}
+    s = PugState(now=NOW, stats=st)
+    for u in range(1, 7):
+        st[u] = {"games": 1, "capt": 0, "w": 0, "l": 0, "d": 0, "elo": 1600}
+    s.phase = Phase.LIVE
+    s.capt_of = {"RED": 1, "BLU": 4}
+    s.team = {"RED": [2, 3], "BLU": [5, 6]}
+    s.queue = {u: 0 for u in range(1, 7)}
+    det = s._record_result("DRAW")
+    assert det["winner"] == "DRAW"
+    assert all(st[u]["elo"] == 1600 for u in range(1, 7))         # balanced -> no movement
+    assert all(st[u]["d"] == 1 and st[u]["w"] == 0 and st[u]["l"] == 0 for u in range(1, 7))
+
+    st = {}
+    s = PugState(now=NOW, stats=st)
+    for u in (1, 2, 3):
+        st[u] = {"games": 1, "capt": 0, "w": 0, "l": 0, "d": 0, "elo": 1800}   # strong RED
+    for u in (4, 5, 6):
+        st[u] = {"games": 1, "capt": 0, "w": 0, "l": 0, "d": 0, "elo": 1400}   # weak BLU
+    s.phase = Phase.LIVE
+    s.capt_of = {"RED": 1, "BLU": 4}
+    s.team = {"RED": [2, 3], "BLU": [5, 6]}
+    s.queue = {u: 0 for u in range(1, 7)}
+    s._record_result("DRAW")
+    assert all(st[u]["elo"] < 1800 for u in (1, 2, 3))            # favorite drops
+    assert all(st[u]["elo"] > 1400 for u in (4, 5, 6))            # underdog rises
+    dn = sum(1800 - st[u]["elo"] for u in (1, 2, 3))
+    up = sum(st[u]["elo"] - 1400 for u in (4, 5, 6))
+    assert abs(dn - up) <= 2                                      # ~zero-sum
+    assert all(abs(st[u]["elo"] - (1800 if u < 4 else 1400)) <= ELO_CLAMP for u in range(1, 7))
+    assert all(st[u]["d"] == 1 and st[u]["w"] == 0 and st[u]["l"] == 0 for u in range(1, 7))
+    print("DD) a draw: balanced no-move, unbalanced converges ~zero-sum, all +1 D no W/L")
+
+    # EE) correcting a misreported match flips Elo + W/L using match-time ratings.
+    st = {}
+    s = PugState(now=NOW, stats=st)
+    for u in range(1, 7):
+        st[u] = {"games": 1, "capt": 0, "w": 0, "l": 0, "d": 0, "elo": 1600}
+    s.phase = Phase.LIVE
+    s.capt_of = {"RED": 1, "BLU": 4}
+    s.team = {"RED": [2, 3], "BLU": [5, 6]}
+    s.queue = {u: 0 for u in range(1, 7)}
+    det = s._record_result("BLU")                    # WRONG: reported BLU win
+    red, blu = det["red"], det["blu"]
+    before = {p: det["elos"][p][0] for p in red + blu}
+    assert all(st[u]["elo"] == 1616 for u in blu) and all(st[u]["elo"] == 1584 for u in red)
+    assert all(st[u]["w"] == 1 for u in blu) and all(st[u]["l"] == 1 for u in red)
+    s.correct_match(red, blu, before, "BLU", "RED")  # fix it to RED win
+    assert all(st[u]["elo"] == 1616 for u in red) and all(st[u]["elo"] == 1584 for u in blu)
+    assert all(st[u]["w"] == 1 and st[u]["l"] == 0 for u in red)
+    assert all(st[u]["l"] == 1 and st[u]["w"] == 0 for u in blu)
+    print("EE) correcting a misreported match flips Elo + W/L exactly (match-time ratings)")
+
+    # EE2) correcting to a draw zeroes the move and records a draw for everyone.
+    s.correct_match(red, blu, before, "RED", "DRAW")
+    assert all(st[u]["elo"] == 1600 for u in red + blu)
+    assert all(st[u]["d"] == 1 and st[u]["w"] == 0 and st[u]["l"] == 0 for u in red + blu)
+    print("EE2) correcting to a draw zeroes the Elo move and records a draw")
 
     print("\nall smoke tests passed.")
