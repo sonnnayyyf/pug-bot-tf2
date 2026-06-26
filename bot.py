@@ -595,7 +595,9 @@ class PugClient(discord.Client):
                 {int(k): int(v) for k, v in (saved.get("immunity") or {}).items()})
             SHARED_STATS.clear()
             SHARED_STATS.update(
-                {int(k): {"games": int(v.get("games", 0)), "capt": int(v.get("capt", 0))}
+                {int(k): {"games": int(v.get("games", 0)), "capt": int(v.get("capt", 0)),
+                          "w": int(v.get("w", 0)), "l": int(v.get("l", 0)),
+                          "d": int(v.get("d", 0)), "elo": int(v.get("elo", ELO_START))}
                  for k, v in (saved.get("stats") or {}).items()})
             for k_str, lob in saved["lobbies"].items():
                 key = _SINGLE if k_str == "None" else int(k_str)
@@ -663,6 +665,21 @@ class PugClient(discord.Client):
                     await channel.send(next_queue_display(guild))
             except discord.HTTPException:
                 pass
+
+    async def on_member_join(self, member):
+        """Give every new (human) member the rally ping role so /promote reaches
+        them. Needs the Server Members intent (on) plus Manage Roles, and the
+        bot's top role must sit ABOVE the Puggers role — otherwise Discord refuses
+        the assignment (caught and ignored here)."""
+        if member.bot:
+            return
+        role = discord.utils.get(member.guild.roles, name=PUG_PING_ROLE)
+        if role is None:
+            return
+        try:
+            await member.add_roles(role, reason="Auto-assign Puggers on join")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
     async def close(self):
         persist()                        # final flush on graceful shutdown
