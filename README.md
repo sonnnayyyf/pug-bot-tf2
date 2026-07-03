@@ -64,6 +64,7 @@ IDLE → QUEUING → READY_CHECK → PICKING → LIVE → (report) → IDLE
 | `/tosscoin` | Flip a coin — heads or tails |
 | `/captstat` | Top 10 players by times rolled as captain |
 | `/elo top` | Top 10 players by Elo rating |
+| `/elo bottom` | Bottom 10 players by Elo rating (shown with their real ladder rank) |
 | `/match log` | List the most recent reported matches |
 | `/match info <id>` | Show one recorded match in full (rosters + before→after Elo) |
 | `/match fix <id> red\|blu\|draw` | Admin: correct a misreported match — recomputes everyone's Elo + W/L/D from the match-time ratings, no hand-math |
