@@ -369,7 +369,9 @@ def draft_embed(guild) -> discord.Embed:
             tag = player_tag(guild, u)
             skill = skill_label(guild, u)
             imm = pug.immunity.get(u)
-            extra = f" · {skill}" if skill else ""
+            elo = SHARED_STATS.get(u, {}).get("elo", ELO_START)
+            extra = f" ({elo})"
+            extra += f" · {skill}" if skill else ""
             extra += f" — **IMMUNE: x{imm}**" if imm else ""
             lines.append(tag + extra)
     lines.append("—")
@@ -1241,12 +1243,18 @@ async def stat_cmd(interaction: discord.Interaction, player: Optional[discord.Me
 elo_group = app_commands.Group(name="elo", description="Ratings.")
 
 
-@elo_group.command(name="top", description="Top 10 players by Elo rating.")
-async def elo_top_cmd(interaction: discord.Interaction):
+def _elo_ranked():
+    """All rated players (bots excluded, at least one game), best Elo first."""
     rows = [(uid, rec) for uid, rec in SHARED_STATS.items()
             if uid not in FAKE_NAMES and rec.get("games", 0) > 0]
     rows.sort(key=lambda r: (-r[1].get("elo", ELO_START), -r[1].get("games", 0)))
-    if not rows:
+    return rows
+
+
+@elo_group.command(name="top", description="Top 10 players by Elo rating.")
+async def elo_top_cmd(interaction: discord.Interaction):
+    ranked = _elo_ranked()
+    if not ranked:
         await interaction.response.send_message(
             "No rated games yet — play some games first!")
         return
@@ -1254,8 +1262,27 @@ async def elo_top_cmd(interaction: discord.Interaction):
     lines = [f"{medals.get(i, f'{i}.')} {name_box(interaction.guild, uid)} — "
              f"**{rec.get('elo', ELO_START)}** Elo "
              f"({rec.get('w', 0)}W–{rec.get('l', 0)}L)"
-             for i, (uid, rec) in enumerate(rows[:10], 1)]
+             for i, (uid, rec) in enumerate(ranked[:10], 1)]
     await interaction.response.send_message("📈 **Top Elo**\n" + "\n".join(lines))
+
+
+@elo_group.command(name="bottom", description="Bottom 10 players by Elo rating.")
+async def elo_bottom_cmd(interaction: discord.Interaction):
+    ranked = _elo_ranked()
+    if not ranked:
+        await interaction.response.send_message(
+            "No rated games yet — play some games first!")
+        return
+    total = len(ranked)
+    tail = ranked[-10:]                       # the lowest up to 10, still best-first
+    start = total - len(tail) + 1             # their real position in the full ladder
+    lines = []
+    for i, (uid, rec) in enumerate(tail, start):
+        prefix = f"{i}. 🥄" if i == total else f"{i}."   # wooden spoon for dead last
+        lines.append(f"{prefix} {name_box(interaction.guild, uid)} — "
+                     f"**{rec.get('elo', ELO_START)}** Elo "
+                     f"({rec.get('w', 0)}W–{rec.get('l', 0)}L)")
+    await interaction.response.send_message("📉 **Bottom Elo**\n" + "\n".join(lines))
 
 
 @elo_group.command(name="set", description="Admin: set a player's Elo to an exact value.")
@@ -1348,6 +1375,7 @@ async def commands_cmd(interaction: discord.Interaction):
         "`/promote` — ping the pugger role for more players\n"
         "`/tosscoin` — flip a coin (heads/tails)\n"
         "`/captstat` — top 10 most-rolled captains · `/elo top` — top 10 by rating\n"
+        "`/elo bottom` — bottom 10 by rating\n"
         "`/stat [@user]` — a player's Elo, W/L, win rate + captaincies\n"
         "`/capfor red|blu` — volunteer to captain · `/capoff` — step down\n"
         "`/pick @user` — draft a player\n"
