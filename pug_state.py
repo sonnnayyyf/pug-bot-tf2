@@ -37,9 +37,11 @@ ELO_START = 1600                 # everyone's starting rating (cosmetic; never g
 ELO_K = 32                       # rating responsiveness (per-player, before clamping)
 ELO_CLAMP = 20                   # hard cap on how much one game can move a player (±)
 
-# RED first. (team, picks_this_turn). 1-2-1-1-1-1-1-1-1 -> 5/5 picks = 6v6.
+# RED first. (team, picks_this_turn). 1-1-1-2-1-1-1-1-1 -> 5/5 picks = 6v6.
+# BLU's double pick sits mid-draft (its 2nd turn) instead of right after RED's
+# first-overall pick, so the first-pick compensation is spread out / fairer.
 PICK_ORDER = [
-    ("RED", 1), ("BLU", 2), ("RED", 1), ("BLU", 1), ("RED", 1),
+    ("RED", 1), ("BLU", 1), ("RED", 1), ("BLU", 2), ("RED", 1),
     ("BLU", 1), ("RED", 1), ("BLU", 1), ("RED", 1),
 ]
 
