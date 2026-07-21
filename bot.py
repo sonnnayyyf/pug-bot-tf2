@@ -389,11 +389,25 @@ def draft_embed(guild) -> discord.Embed:
                          color=discord.Color.blurple())
 
 
+def _team_avg_elo(color):
+    """Average Elo of a full side (captain + picks). None if the side is empty."""
+    capt = pug.capt_of.get(color)
+    members = ([capt] if capt else []) + list(pug.team[color])
+    if not members:
+        return None
+    total = sum(SHARED_STATS.get(u, {}).get("elo", ELO_START) for u in members)
+    return round(total / len(members))
+
+
 def final_embed(guild) -> discord.Embed:
     dot = {"RED": "🔴", "BLU": "🔵"}
     lines = []
     for color in ("RED", "BLU"):
-        lines.append(f"{dot[color]} **{color}**")
+        avg = _team_avg_elo(color)
+        header = f"{dot[color]} **{color}**"
+        if avg is not None:
+            header += f" — avg {avg} Elo"
+        lines.append(header)
         lines.append(team_roster(guild, color))
     lines.append("—")
     connect = f"<#{CONNECT_CHANNEL_ID}>" if CONNECT_CHANNEL_ID else "#connect-string"
@@ -521,7 +535,7 @@ class ReadyView(discord.ui.View):
         self.stop()
         _ready_views[self.key] = None
         await interaction.response.edit_message(
-            content=f"**Ready check aborted** — {name_box(self.guild, interaction.user.id)} "
+            content=f"**Ready check aborted** — {interaction.user.mention} "
                     "left the queue.",
             view=None)
         await render_active(self.channel, self.guild)
@@ -670,18 +684,25 @@ class PugClient(discord.Client):
 
     async def on_member_join(self, member):
         """Give every new (human) member the rally ping role so /promote reaches
-        them. Needs the Server Members intent (on) plus Manage Roles, and the
-        bot's top role must sit ABOVE the Puggers role — otherwise Discord refuses
-        the assignment (caught and ignored here)."""
+        them. Needs the Server Members intent, Manage Roles, and the bot's top role
+        ABOVE the Puggers role. Outcomes are logged (not swallowed) so a misconfig
+        shows up in the console instead of failing invisibly."""
         if member.bot:
             return
-        role = discord.utils.get(member.guild.roles, name=PUG_PING_ROLE)
+        role = discord.utils.find(
+            lambda r: r.name.lower() == PUG_PING_ROLE.lower(), member.guild.roles)
         if role is None:
+            print(f"[on_member_join] no role named '{PUG_PING_ROLE}' in "
+                  f"{member.guild.name} — nothing assigned to {member}")
             return
         try:
             await member.add_roles(role, reason="Auto-assign Puggers on join")
-        except (discord.Forbidden, discord.HTTPException):
-            pass
+            print(f"[on_member_join] gave '{role.name}' to {member} ({member.id})")
+        except discord.Forbidden:
+            print(f"[on_member_join] FORBIDDEN adding '{role.name}' to {member} — "
+                  "give the bot Manage Roles and move its role ABOVE Puggers")
+        except discord.HTTPException as e:
+            print(f"[on_member_join] HTTP error adding '{role.name}' to {member}: {e}")
 
     async def close(self):
         persist()                        # final flush on graceful shutdown
