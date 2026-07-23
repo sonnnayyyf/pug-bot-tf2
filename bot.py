@@ -16,6 +16,9 @@ import asyncio
 import random
 import difflib
 import re
+import sqlite3
+import tempfile
+import datetime
 from typing import Optional
 
 import discord
@@ -82,6 +85,10 @@ PUG_CHANNEL_IDS = _parse_channel_ids(
 # teams embed so people know where to go. Set CONNECT_CHANNEL_ID (channel ID) to
 # make it a clickable #mention; left unset, a plain "#connect-string" is shown.
 CONNECT_CHANNEL_ID = int(os.environ["CONNECT_CHANNEL_ID"]) if os.environ.get("CONNECT_CHANNEL_ID") else None
+
+# Private channel the bot uploads pug.db backups to (off-node copy that survives
+# the host dying). Defaults to the configured channel; override via env if needed.
+BACKUP_CHANNEL_ID = int(os.environ.get("BACKUP_CHANNEL_ID") or "1529335801039556738")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -417,6 +424,52 @@ def final_embed(guild) -> discord.Embed:
     return discord.Embed(title="Teams set — GLHF!",
                          description="\n".join(lines),
                          color=discord.Color.green())
+
+
+def _snapshot_db_sync(dst):
+    """Write a *consistent* copy of pug.db to dst using SQLite's backup API, which
+    is safe even if a write is happening at the same moment (unlike a raw file
+    copy, which could catch a half-written page). Runs in a worker thread."""
+    src = os.environ.get("PUG_DB", "pug.db")
+    con = sqlite3.connect(src)
+    bck = sqlite3.connect(dst)
+    try:
+        with bck:
+            con.backup(bck)
+    finally:
+        bck.close()
+        con.close()
+
+
+async def backup_db(reason=""):
+    """Snapshot pug.db and upload it to the backup channel. Returns (ok, info).
+    Never raises — a failed backup should never break the flow that triggered it."""
+    if not BACKUP_CHANNEL_ID:
+        return False, "no backup channel configured"
+    ch = client.get_channel(BACKUP_CHANNEL_ID)
+    if ch is None:
+        try:
+            ch = await client.fetch_channel(BACKUP_CHANNEL_ID)
+        except discord.HTTPException:
+            print(f"[backup] channel {BACKUP_CHANNEL_ID} not found / no access")
+            return False, "backup channel not found or bot has no access"
+    fd, tmp = tempfile.mkstemp(suffix=".db", prefix="pugbak_")
+    os.close(fd)
+    try:
+        await asyncio.to_thread(_snapshot_db_sync, tmp)
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d_%H%M")
+        note = f" · {reason}" if reason else ""
+        await ch.send(content=f"🗄️ `pug.db` backup — {ts} UTC{note}",
+                      file=discord.File(tmp, filename=f"pug-{ts}.db"))
+        return True, ts
+    except (discord.HTTPException, OSError, sqlite3.Error) as e:
+        print(f"[backup] failed: {e}")
+        return False, str(e)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def results_embed(guild, mid, detail) -> discord.Embed:
@@ -943,6 +996,8 @@ async def match_report_cmd(interaction: discord.Interaction,
     if pug.queue_ids():
         await render_active(interaction.channel, interaction.guild)
     await after_commit(interaction.channel, interaction.guild)
+    # off-node backup of the DB now that a game (and its Elo/records) is committed
+    await backup_db(reason=f"after match #{mid}" if mid else "after match")
 
 
 @match_group.command(name="cancel", description="Admin: end a match with NO result — void a live game or scrap a forming one.")
@@ -1335,6 +1390,19 @@ async def elo_add_cmd(interaction: discord.Interaction,
 
 
 client.tree.add_command(elo_group)
+
+
+@client.tree.command(name="backup", description="Admin: snapshot pug.db and upload it to the backup channel now.")
+async def backup_cmd(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)   # snapshot + upload can take a beat
+    ok, info = await backup_db(reason="manual")
+    if ok:
+        await interaction.followup.send(f"✅ Backup uploaded ({info} UTC).", ephemeral=True)
+    else:
+        await interaction.followup.send(f"⚠️ Backup failed: {info}", ephemeral=True)
 
 
 @client.tree.command(name="tosscoin", description="Flip a coin — heads or tails.")
