@@ -574,18 +574,19 @@ class PugState:
 
     # ---------- subs ----------
     def request_sub(self, uid):
-        if self.phase != Phase.PICKING:
-            return False, "Subs can only be used during the draft stage."
+        if self.phase not in (Phase.PICKING, Phase.LIVE):
+            return False, "Subs can only be used during the draft or a live game."
         if uid not in self.queue:
-            return False, "You're not in a queue."
-        if uid in self.sub_requests:
-            return False, "You already requested a sub."
+            return False, "You're not in this game."
+        if uid in self.sub_requests:                      # run again to cancel
+            self.sub_requests.remove(uid)
+            return True, f"<@{uid}> is no longer looking for a sub."
         self.sub_requests.append(uid)
         return True, f"<@{uid}> wants a sub. Use /subfor to take the spot."
 
     def sub_for(self, new_uid, target_uid=None):
-        if self.phase != Phase.PICKING:
-            return False, "Subs can only be used during the draft stage."
+        if self.phase not in (Phase.PICKING, Phase.LIVE):
+            return False, "Subs can only be used during the draft or a live game."
         if new_uid in self.queue:
             return False, "You're already in this game."
         if not self.sub_requests:
@@ -598,7 +599,32 @@ class PugState:
             target = self.sub_requests[0]
         self._swap(target, new_uid)
         self.sub_requests.remove(target)
+        if self.phase is Phase.LIVE:
+            self._credit_live_sub(new_uid)
         return True, f"<@{new_uid}> subbed in for <@{target}>."
+
+    def admin_sub(self, out_uid, in_uid):
+        """Admin force-replace — for an AFK / no-show who never ran /subme.
+        Works in the draft or a live game; no open sub request required."""
+        if self.phase not in (Phase.PICKING, Phase.LIVE):
+            return False, "Can only sub during the draft or a live game."
+        if out_uid not in self.queue:
+            return False, "That player isn't in this game."
+        if in_uid in self.queue:
+            return False, "That player is already in this game."
+        self._swap(out_uid, in_uid)
+        if out_uid in self.sub_requests:
+            self.sub_requests.remove(out_uid)
+        if self.phase is Phase.LIVE:
+            self._credit_live_sub(in_uid)
+        return True, f"<@{in_uid}> was subbed in for <@{out_uid}> by an admin."
+
+    def _credit_live_sub(self, in_uid):
+        """A player subbed into a LIVE game counts the game and gets med immunity
+        — go-live (which normally grants both) already ran for this match, so we
+        apply them here for the incoming player."""
+        self._stat_rec(in_uid)["games"] += 1
+        self.immunity[in_uid] = IMMUNITY_GAMES
 
     def _swap(self, out_uid, in_uid):
         if out_uid in self.queue:
@@ -863,18 +889,41 @@ if __name__ == "__main__":
     assert 1 not in s2._roll_captains(P) and 2 not in s2._roll_captains(P)
     print("F) immune players excluded from captain roll")
 
-    # G) subs only work in PICKING
+    # G) subs work in PICKING + LIVE; blocked pre-draft; /subme toggles off
     sg = fresh(); fill(sg, P[:5])                 # QUEUING
     assert sg.request_sub(P[0])[0] is False
     assert sg.sub_for(99)[0] is False
     clock["t"] = 1000.0
     sg = fresh(); fill(sg, P)                      # PICKING (all auto-ready)
-    assert sg.request_sub(P[0])[0] is True
-    assert sg.sub_for(99)[0] is True
+    assert sg.request_sub(P[0])[0] is True and P[0] in sg.sub_requests
+    assert sg.request_sub(P[0])[0] is True and P[0] not in sg.sub_requests  # 2nd call cancels
+    assert sg.request_sub(P[0])[0] is True         # request again
+    assert sg.sub_for(99)[0] is True and 99 in sg.queue and P[0] not in sg.queue
     s_live = fresh(); fill(s_live, P); cps = drive_draft(s_live)
     assert s_live.phase is Phase.LIVE
-    assert s_live.request_sub(cps[0])[0] is False
-    print("G) subs allowed only in PICKING (blocked in queue/ready/live)")
+    assert s_live.request_sub(cps[0])[0] is True and cps[0] in s_live.sub_requests  # mid-game
+    assert s_live.sub_for(99)[0] is True and 99 in s_live.queue and cps[0] not in s_live.queue
+    print("G) subs work in PICKING + LIVE, blocked pre-draft; /subme toggles off")
+
+    # G2) admin_sub force-replaces without a request; live subs get game + immunity
+    s = fresh(); fill(s, P); cps = drive_draft(s)          # LIVE
+    assert s.phase is Phase.LIVE
+    victim = cps[0]                                        # a captain (medic)
+    g_before = s._stat_rec(99).get("games", 0)
+    ok, _ = s.admin_sub(victim, 99)                        # 99 never ran /subme
+    assert ok and 99 in s.queue and victim not in s.queue
+    assert s._stat_rec(99)["games"] == g_before + 1        # game credited
+    assert s.immunity.get(99) == IMMUNITY_GAMES            # immunity granted
+    assert s.capt_of["RED"] == 99 or s.capt_of["BLU"] == 99  # inherited the med slot
+    assert s.admin_sub(victim, 99)[0] is False             # victim already gone
+    assert s.admin_sub(98, 97)[0] is False                 # 98 isn't in the game
+    # a player-driven /subfor in LIVE credits the same way
+    s2 = fresh(); fill(s2, P); drive_draft(s2)
+    s2.request_sub(next(iter(s2.queue)))
+    inc = 95
+    assert s2.sub_for(inc)[0] is True
+    assert s2._stat_rec(inc)["games"] == 1 and s2.immunity.get(inc) == IMMUNITY_GAMES
+    print("G2) admin_sub works w/o request; live subs get game + immunity")
 
     # H) anyone (not just the rolled captains) can volunteer to captain,
     #    and immunity follows whoever actually captained
