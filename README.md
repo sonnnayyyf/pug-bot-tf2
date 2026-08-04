@@ -14,7 +14,7 @@ Built with [discord.py](https://github.com/Rapptz/discord.py) (slash commands + 
 - **Captain draft** — two captains are rolled (excluding medic-immune players), but anyone in the match can volunteer with `/capfor`, and captains can step down with `/capoff`. The draft board shows each unpicked player's skill division (from their server role) and immunity. When only one player is left, they're auto-assigned so the last captain skips a no-choice pick.
 - **Snake-ish pick order** (`1-1-1-2-1-1-1-1-1`) that produces balanced 6v6 teams, with the captains as the two medics. BLU's double pick sits mid-draft to spread out the first-pick compensation.
 - **Medic immunity** — whoever captains/medics a game gets immunity for their next **2** games (so they won't be forced to med again), tracked per-player, capped, and non-stacking.
-- **Substitutions** during the draft stage (`/subme` to request, `/subfor` to fill).
+- **Substitutions** during the draft *or* a live game (`/subme` to request — run again to cancel — and `/subfor` to fill). Admins can force a swap for AFK/no-shows with `/match sub`. A player subbed into a *live* game is credited with the game played and med immunity.
 - **Next queue** — while a game is forming or live, new joins line up in a separate queue; when the active match is reported, that queue is promoted (and starts its own ready check if it's already full). One game forms/plays at a time, with the next lined up behind it.
 - **A game stays live until it's reported** — a live match doesn't end on a timer; it remains live until a captain reports the winner (`/match report red|blu`) or an admin ends it. New joins line up in the next queue meanwhile and start once the current game is closed out.
 - **Persistence** — all state (queue, live match, immunity, auto-ready, next queue) is snapshotted to a local SQLite file (`pug.db`) and reloaded on boot, so a restart or crash resumes the active game instead of wiping it.
@@ -59,8 +59,8 @@ IDLE → QUEUING → READY_CHECK → PICKING → LIVE → (report) → IDLE
 | `/capfor red\|blu` | Volunteer to captain a side |
 | `/capoff` | Step down as captain |
 | `/pick @player` | Draft a player (current picker only) |
-| `/subme` | Request a substitute (draft stage only) |
-| `/subfor [@player]` | Sub in for someone (draft stage only) |
+| `/subme` | Request a substitute; run again to cancel (draft or live) |
+| `/subfor [@player]` | Sub in for someone (draft or live) |
 | `/promote` | Ping the rally role with how many more players are needed (2-min cooldown) |
 | `/tosscoin` | Flip a coin — heads or tails |
 | `/captstat` | Top 10 players by times rolled as captain |
