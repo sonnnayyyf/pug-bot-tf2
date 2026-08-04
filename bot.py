@@ -954,13 +954,13 @@ async def pick_cmd(interaction: discord.Interaction, player: discord.Member):
 
 
 # ---------- slash: subs ----------
-@client.tree.command(name="subme", description="Request a substitute for your spot (draft stage only).")
+@client.tree.command(name="subme", description="Request a substitute for your spot — run again to cancel (draft or live).")
 async def subme_cmd(interaction: discord.Interaction):
     ok, msg = pug.request_sub(interaction.user.id)
     await interaction.response.send_message(msg, ephemeral=not ok)
 
 
-@client.tree.command(name="subfor", description="Sub in for someone who asked (draft stage only).")
+@client.tree.command(name="subfor", description="Sub in for someone who asked (draft or live game).")
 @app_commands.describe(player="(optional) whose spot to take")
 async def subfor_cmd(interaction: discord.Interaction, player: Optional[discord.Member] = None):
     ok, msg = pug.sub_for(interaction.user.id, player.id if player else None)
@@ -1048,6 +1048,21 @@ async def match_start_cmd(interaction: discord.Interaction):
         await interaction.response.send_message(msg, ephemeral=True)
         return
     await interaction.response.send_message(embed=final_embed(interaction.guild))
+
+
+@match_group.command(name="sub", description="Admin: force-replace a player (AFK/no-show who didn't /subme).")
+@app_commands.describe(out="player to remove", into="player to bring in")
+async def match_sub_cmd(interaction: discord.Interaction,
+                        out: discord.Member, into: discord.Member):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    ok, msg = pug.admin_sub(out.id, into.id)
+    if not ok:
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+    await interaction.response.send_message(msg)
+    await render_active(interaction.channel, interaction.guild)   # show updated teams
 
 
 @match_group.command(name="log", description="Show the most recent reported matches.")
@@ -1468,7 +1483,7 @@ async def commands_cmd(interaction: discord.Interaction):
         "`/stat [@user]` — a player's Elo, W/L, win rate + captaincies\n"
         "`/capfor red|blu` — volunteer to captain · `/capoff` — step down\n"
         "`/pick @user` — draft a player\n"
-        "`/subme` — request a sub · `/subfor` — sub in (draft stage)\n"
+        "`/subme` — request a sub (run again to cancel) · `/subfor` — sub in (draft or live)\n"
         "`/match report red|blu|draw` — report the result of the live game (captain/admin)\n"
         "`/match cancel` — admin: end a match with no result (void a live game or scrap a forming one)\n"
         "`/match log` · `/match info <id>` — browse recorded matches\n"
