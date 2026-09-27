@@ -45,10 +45,17 @@ PICK_ORDER = [
     ("BLU", 1), ("RED", 1), ("BLU", 1), ("RED", 1),
 ]
 
+# Straight alternating order (no double pick): RED, BLU, RED, BLU, … -> 5/5.
+# Used where a mid-draft double pick isn't wanted (e.g. a tiered draft).
+STRAIGHT_PICK_ORDER = [("RED", 1), ("BLU", 1)] * (QUEUE_SIZE // 2 - 1)
+
 
 class PugState:
-    def __init__(self, now=time.time, immunity=None, stats=None):
+    def __init__(self, now=time.time, immunity=None, stats=None, pick_order=None):
         self._now = now
+        # per-instance draft order (a lobby may run a non-default one, e.g. the
+        # no-double STRAIGHT_PICK_ORDER); defaults to the shared PICK_ORDER.
+        self.pick_order = pick_order if pick_order is not None else PICK_ORDER
         # immunity may be a dict shared across several PugStates (multi-lobby:
         # immunity is a property of the player, not the channel). We only ever
         # mutate it in place so the shared reference stays intact.
@@ -146,7 +153,7 @@ class PugState:
         return set(self._all_players())
 
     def _current_team(self):
-        return PICK_ORDER[self.turn_idx][0]
+        return self.pick_order[self.turn_idx][0]
 
     def _current_picker(self):
         return self.capt_of.get(self._current_team())
@@ -314,7 +321,7 @@ class PugState:
         self.captains = self._roll_captains(players)
         self.phase = Phase.PICKING
         self.turn_idx = 0
-        self.picks_left = PICK_ORDER[0][1]
+        self.picks_left = self.pick_order[0][1]
         self.ready = set()
         return True, "draft"
 
@@ -360,10 +367,10 @@ class PugState:
         """Consume the current pick slot; move to the next, or go live if done."""
         if self.picks_left == 0:
             self.turn_idx += 1
-            if self.turn_idx >= len(PICK_ORDER):
+            if self.turn_idx >= len(self.pick_order):
                 self._go_live()
             else:
-                self.picks_left = PICK_ORDER[self.turn_idx][1]
+                self.picks_left = self.pick_order[self.turn_idx][1]
 
     def _draft_full(self):
         """True when both captains are set and every slot is filled (6v6) — the

@@ -30,7 +30,7 @@ from storage import Store
 from pug_state import (PugState, Phase, QUEUE_SIZE,
                        DEFAULT_AR_SECONDS, AR_COMMAND_SECONDS,
                        MAX_AR_SECONDS, READY_CHECK_SECONDS, TIMEOUT_SECONDS,
-                       ELO_START)
+                       ELO_START, STRAIGHT_PICK_ORDER)
 
 # Load DISCORD_TOKEN / TEST_GUILD_ID / PUG_DEBUG from a local .env file if
 # python-dotenv is installed; otherwise fall back to shell environment vars.
@@ -211,8 +211,10 @@ _last_promote = {}               # lobby_key -> monotonic time of last /promote 
 
 def _new_state(c):
     # point this lobby's stats/immunity at its guild's shared dicts, so med
-    # immunity + records are shared within a server but isolated between servers
-    return PugState(immunity=c.immunity, stats=c.stats)
+    # immunity + records are shared within a server but isolated between servers.
+    # Tiered guilds draft with a straight 1-1 order (no mid-draft double pick).
+    return PugState(immunity=c.immunity, stats=c.stats,
+                    pick_order=STRAIGHT_PICK_ORDER if c.tiered else None)
 
 
 # Pre-create the configured lobbies (or a single shared one if none configured).

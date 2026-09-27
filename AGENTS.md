@@ -79,6 +79,8 @@ Cross-server rules are scoped per `GuildCtx`:
   (unrestricted), Tier 2 = Tree, Tier 3 = Elder Tree. A player with none or
   multiple tier roles falls back to `TIER_FALLBACK` (Tier 1). Enforced in
   `pick_cmd` (and the debug `pickname`). Server 1 has no concept of tiers.
+  Tiered lobbies also draft with `STRAIGHT_PICK_ORDER` (plain 1-1, no mid-draft
+  BLU double pick) via the per-instance `PugState.pick_order`.
 - **Elo off (`elo: false`)** — W/L/D, win rate, and captain counts stay; only the
   Elo number/ranking is dropped. `pug_state.py` still computes Elo internally
   (it's guild-agnostic), so `bot.py` snapshots and **restores** ratings around
