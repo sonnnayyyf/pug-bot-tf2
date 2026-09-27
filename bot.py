@@ -115,18 +115,21 @@ from lobby import reconcile, blocking_cid
 #                 "backup_channel_id": 1553780865090326558,
 #                 "connect_channel_id": 1546391663906394162,
 #                 "ping_role": "Puggers",
+#                 "admin_roles": ["Groundskeeper", "Gardener"],
 #                 "tiered": true, "elo": false}]'
 #
 # Keys: guild_id (int, for per-guild lookups like auto-role on join), channels
 # (list of channel IDs — each an independent lobby), db (its SQLite file), and
-# the optional backup_channel_id / connect_channel_id / ping_role / tiered / elo.
+# the optional backup_channel_id / connect_channel_id / ping_role / admin_roles
+# (role names that grant admin, besides the Administrator perm) / tiered / elo.
 class GuildCtx:
     """Everything that is per-server: its DB store, its shared-across-its-lobbies
     stats + immunity dicts, its backup/connect channels, ping role, and the two
     rule flags (tiered draft, elo on/off)."""
 
     def __init__(self, *, db, ping_role=DEFAULT_PING_ROLE, backup_channel_id=None,
-                 connect_channel_id=None, tiered=False, elo=True, guild_id=None):
+                 connect_channel_id=None, tiered=False, elo=True, guild_id=None,
+                 admin_roles=None):
         self.db_path = db
         self.store = Store(db)
         self.immunity = {}            # {uid: games} — shared across this guild's lobbies
@@ -137,6 +140,8 @@ class GuildCtx:
         self.tiered = tiered
         self.elo = elo
         self.guild_id = guild_id
+        # role names (besides the Administrator permission) that grant admin here
+        self.admin_roles = admin_roles or [ADMIN_ROLE]
         self.last_saved = None        # last snapshot written to this store
 
 
@@ -163,6 +168,9 @@ _ctx_by_gid = {}         # guild_id  -> GuildCtx (for guild-scoped lookups)
 all_ctxs = [DEFAULT_CTX]
 
 for _entry in _parse_guilds(os.environ.get("PUG_GUILDS")):
+    _admin = _entry.get("admin_roles")
+    if isinstance(_admin, str):
+        _admin = [_admin]
     _c = GuildCtx(
         db=_entry["db"],
         ping_role=_entry.get("ping_role", DEFAULT_PING_ROLE),
@@ -170,7 +178,8 @@ for _entry in _parse_guilds(os.environ.get("PUG_GUILDS")):
         connect_channel_id=_entry.get("connect_channel_id"),
         tiered=bool(_entry.get("tiered", False)),
         elo=bool(_entry.get("elo", True)),
-        guild_id=_entry.get("guild_id"))
+        guild_id=_entry.get("guild_id"),
+        admin_roles=_admin)
     all_ctxs.append(_c)
     if _c.guild_id is not None:
         _ctx_by_gid[int(_c.guild_id)] = _c
@@ -424,7 +433,8 @@ def is_admin(member) -> bool:
     perms = getattr(member, "guild_permissions", None)
     if perms and perms.administrator:
         return True
-    return any(r.name == ADMIN_ROLE for r in getattr(member, "roles", []))
+    allowed = ctx().admin_roles                  # per-server admin role names
+    return any(r.name in allowed for r in getattr(member, "roles", []))
 
 
 def fmt_dur(seconds: int) -> str:

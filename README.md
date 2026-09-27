@@ -173,14 +173,18 @@ PUG_GUILDS=[{"guild_id": 1546370985320648735,
              "backup_channel_id": 1553780865090326558,
              "connect_channel_id": 1546391663906394162,
              "ping_role": "Puggers",
+             "admin_roles": ["Groundskeeper", "Gardener"],
              "tiered": true,
              "elo": false}]
 ```
 
 Per-server keys: `guild_id` (used for per-guild lookups like auto-role on join),
 `channels` (each an independent lobby), `db` (its SQLite file), and the optional
-`backup_channel_id` / `connect_channel_id` / `ping_role` / `tiered` / `elo`.
+`backup_channel_id` / `connect_channel_id` / `ping_role` / `admin_roles` / `tiered` / `elo`.
 
+- **`admin_roles`** — role names that can run admin commands on this server
+  (besides members with Discord's Administrator permission). Defaults to
+  `["PUG Admin"]` if omitted.
 - **`tiered: true`** — a hard draft restriction from Discord roles: a higher tier
   can't be picked until every lower-tier player is drafted. Tier 1 = **Seed** /
   **Sprout** (unrestricted), Tier 2 = **Tree**, Tier 3 = **Elder Tree** (picked

@@ -48,7 +48,8 @@ modeled by `GuildCtx` in `bot.py`.
   `PUG_PING_ROLE`). Elo on, no tiers. Left untouched when adding more servers.
 - **`PUG_GUILDS`** — a JSON list env var, one object per extra server. Keys:
   `guild_id`, `channels` (each an independent lobby), `db`, `backup_channel_id`,
-  `connect_channel_id`, `ping_role`, `tiered` (bool), `elo` (bool). Its channels
+  `connect_channel_id`, `ping_role`, `admin_roles` (role names granting admin,
+  besides the Administrator perm), `tiered` (bool), `elo` (bool). Its channels
   are auto-added to the locked channel set.
 
 Routing:
@@ -67,6 +68,8 @@ Cross-server rules are scoped per `GuildCtx`:
   one-game-at-a-time is enforced within a server only — never across servers.
 - Persistence is per store: `persist()` / `setup_hook` load / `close()` iterate
   `all_ctxs`, each reading/writing its own DB file.
+- `is_admin()` checks the current guild's `admin_roles` (default `["PUG Admin"]`)
+  or the Administrator permission.
 
 ## Server-2 rule flags
 
