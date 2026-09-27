@@ -830,9 +830,13 @@ class PugClient(discord.Client):
             c.last_saved = json.dumps(saved, sort_keys=True)
         gid = os.environ.get("TEST_GUILD_ID")
         if gid:
-            guild = discord.Object(id=int(gid))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)          # register in the guild (instant)
+            # instant per-guild sync for the dev guild AND every configured extra
+            # server, so slash commands show up immediately in all of them
+            extra = [int(c.guild_id) for c in all_ctxs if c.guild_id is not None]
+            for g in dict.fromkeys([int(gid)] + extra):
+                obj = discord.Object(id=g)
+                self.tree.copy_global_to(guild=obj)
+                await self.tree.sync(guild=obj)
             # remove any stale GLOBAL registrations so they don't duplicate the guild ones
             self.tree.clear_commands(guild=None)
             await self.tree.sync()
