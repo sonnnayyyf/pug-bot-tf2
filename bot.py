@@ -42,9 +42,9 @@ except ImportError:
 
 ADMIN_ROLE = "PUG Admin"
 
-# Role that /promote pings to rally players (matched case-insensitively against
-# the server's role names). Edit to match your server's role exactly.
-PUG_PING_ROLE = "Puggers"
+# Default rally-ping role name (per-guild; overridable per server via PUG_GUILDS).
+# Matched case-insensitively against the server's role names.
+DEFAULT_PING_ROLE = "Puggers"
 PROMOTE_COOLDOWN = 120          # seconds between /promote pings (anti-spam)
 
 # Skill-division roles shown next to unpicked players during the draft, so
@@ -56,6 +56,19 @@ SKILL_ROLES = [
     ("div 2", "Div 2"),
     ("div 3", "Div 3"),
 ]
+
+# --- Tiered draft (only on guilds configured with "tiered": true) ------------
+# A hard draft restriction derived straight from a player's Discord roles: a
+# higher tier can't be picked until every lower-tier player has been drafted.
+# Role names are matched case-insensitively (exact name, not substring). A player
+# with none OR multiple of these roles falls back to TIER_FALLBACK.
+TIER_ROLES = [
+    (("seed", "sprout"), 1),     # Tier 1 — newbies, unrestricted
+    (("tree",), 2),              # Tier 2 — intermediate, locked until T1 drafted
+    (("elder tree",), 3),        # Tier 3 — invite, locked until T2 drafted
+]
+TIER_NAMES = {1: "Seed/Sprout", 2: "Tree", 3: "Elder Tree"}
+TIER_FALLBACK = 1                # none/multiple of the tier roles -> treat as Tier 1
 
 # If set, the bot ONLY responds in this one channel; commands anywhere else are
 # ignored (text) or get a quiet "wrong channel" notice (slash). This stops people
@@ -81,15 +94,6 @@ def _parse_channel_ids(raw):
 PUG_CHANNEL_IDS = _parse_channel_ids(
     os.environ.get("PUG_CHANNEL_ID") or os.environ.get("PUG_CHANNEL_IDS") or "")
 
-# Channel where players post/find the server connect string. Shown on the live
-# teams embed so people know where to go. Set CONNECT_CHANNEL_ID (channel ID) to
-# make it a clickable #mention; left unset, a plain "#connect-string" is shown.
-CONNECT_CHANNEL_ID = int(os.environ["CONNECT_CHANNEL_ID"]) if os.environ.get("CONNECT_CHANNEL_ID") else None
-
-# Private channel the bot uploads pug.db backups to (off-node copy that survives
-# the host dying). Defaults to the configured channel; override via env if needed.
-BACKUP_CHANNEL_ID = int(os.environ.get("BACKUP_CHANNEL_ID") or "1529335801039556738")
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -97,9 +101,97 @@ intents.members = True
 import contextvars
 from lobby import reconcile, blocking_cid
 
+
+# ---------- per-guild configuration ----------
+# Each Discord server the bot runs in is fully ISOLATED: its own SQLite file,
+# stats, med immunity, backup channel, rally-ping role, and rule flags. Server 1
+# (the original) is configured with the classic env vars below (DEFAULT_CTX) and
+# is left completely untouched. Extra servers are described by PUG_GUILDS — a
+# JSON list, one object per server, e.g.:
+#
+#   PUG_GUILDS='[{"guild_id": 1546370985320648735,
+#                 "channels": [1553780642167267388],
+#                 "db": "treepug.db",
+#                 "backup_channel_id": 1553780865090326558,
+#                 "connect_channel_id": 1546391663906394162,
+#                 "ping_role": "Puggers",
+#                 "tiered": true, "elo": false}]'
+#
+# Keys: guild_id (int, for per-guild lookups like auto-role on join), channels
+# (list of channel IDs — each an independent lobby), db (its SQLite file), and
+# the optional backup_channel_id / connect_channel_id / ping_role / tiered / elo.
+class GuildCtx:
+    """Everything that is per-server: its DB store, its shared-across-its-lobbies
+    stats + immunity dicts, its backup/connect channels, ping role, and the two
+    rule flags (tiered draft, elo on/off)."""
+
+    def __init__(self, *, db, ping_role=DEFAULT_PING_ROLE, backup_channel_id=None,
+                 connect_channel_id=None, tiered=False, elo=True, guild_id=None):
+        self.db_path = db
+        self.store = Store(db)
+        self.immunity = {}            # {uid: games} — shared across this guild's lobbies
+        self.stats = {}               # {uid: {"games","capt","w","l","d","elo"}}
+        self.ping_role = ping_role
+        self.backup_channel_id = backup_channel_id
+        self.connect_channel_id = connect_channel_id
+        self.tiered = tiered
+        self.elo = elo
+        self.guild_id = guild_id
+        self.last_saved = None        # last snapshot written to this store
+
+
+def _parse_guilds(raw):
+    try:
+        data = json.loads(raw) if raw else []
+    except (ValueError, TypeError):
+        print("[config] PUG_GUILDS is not valid JSON — ignoring it")
+        return []
+    return data if isinstance(data, list) else [data]
+
+
+# Server 1 / default: the legacy single-server setup, unchanged.
+DEFAULT_CTX = GuildCtx(
+    db=os.environ.get("PUG_DB", "pug.db"),
+    ping_role=os.environ.get("PUG_PING_ROLE", DEFAULT_PING_ROLE),
+    backup_channel_id=int(os.environ.get("BACKUP_CHANNEL_ID") or "1529335801039556738"),
+    connect_channel_id=(int(os.environ["CONNECT_CHANNEL_ID"])
+                        if os.environ.get("CONNECT_CHANNEL_ID") else None),
+    tiered=False, elo=True)
+
+_ctx_by_channel = {}     # channel_id -> GuildCtx (extra servers only)
+_ctx_by_gid = {}         # guild_id  -> GuildCtx (for guild-scoped lookups)
+all_ctxs = [DEFAULT_CTX]
+
+for _entry in _parse_guilds(os.environ.get("PUG_GUILDS")):
+    _c = GuildCtx(
+        db=_entry["db"],
+        ping_role=_entry.get("ping_role", DEFAULT_PING_ROLE),
+        backup_channel_id=_entry.get("backup_channel_id"),
+        connect_channel_id=_entry.get("connect_channel_id"),
+        tiered=bool(_entry.get("tiered", False)),
+        elo=bool(_entry.get("elo", True)),
+        guild_id=_entry.get("guild_id"))
+    all_ctxs.append(_c)
+    if _c.guild_id is not None:
+        _ctx_by_gid[int(_c.guild_id)] = _c
+    for _cid in _entry.get("channels", []):
+        _cid = int(_cid)
+        _ctx_by_channel[_cid] = _c
+        if _cid not in PUG_CHANNEL_IDS:   # extra-server channels are locked lobbies too
+            PUG_CHANNEL_IDS.append(_cid)
+
+
+def ctx_for_key(key):
+    """The GuildCtx a lobby key belongs to (DEFAULT_CTX for server 1 / single)."""
+    return _ctx_by_channel.get(key, DEFAULT_CTX)
+
+
+def ctx():
+    """The GuildCtx for the current task's active lobby."""
+    return ctx_for_key(_cur_key.get())
+
+
 # ---------- lobby registry (one independent game per configured channel) ----------
-SHARED_IMMUNITY = {}             # med immunity is shared across lobbies (per-player)
-SHARED_STATS = {}                # lifetime {uid: {"games","capt","w","l","d","elo"}}, shared across lobbies
 _SINGLE = None                   # lobby key used when no channels are configured
 lobbies = {}                     # lobby_key -> PugState
 _ready_views = {}                # lobby_key -> ReadyView | None
@@ -108,18 +200,25 @@ _resume_keys = {}                # lobby_key -> channel_id to resume in (from sn
 _last_promote = {}               # lobby_key -> monotonic time of last /promote ping
 
 
-def _new_state():
-    return PugState(immunity=SHARED_IMMUNITY, stats=SHARED_STATS)
+def _new_state(c):
+    # point this lobby's stats/immunity at its guild's shared dicts, so med
+    # immunity + records are shared within a server but isolated between servers
+    return PugState(immunity=c.immunity, stats=c.stats)
 
 
 # Pre-create the configured lobbies (or a single shared one if none configured).
 if PUG_CHANNEL_IDS:
     for _cid in PUG_CHANNEL_IDS:
-        lobbies[_cid] = _new_state()
+        lobbies[_cid] = _new_state(ctx_for_key(_cid))
 else:
-    lobbies[_SINGLE] = _new_state()
+    lobbies[_SINGLE] = _new_state(DEFAULT_CTX)
 
 _cur_key = contextvars.ContextVar("cur_lobby_key", default=_SINGLE)
+
+
+def guild_lobbies(c):
+    """The subset of lobbies belonging to one GuildCtx (that server's games)."""
+    return {k: st for k, st in lobbies.items() if ctx_for_key(k) is c}
 
 
 def lobby_key_for(channel_id):
@@ -156,11 +255,14 @@ pug = _LobbyProxy()
 
 
 def cross_block_msg(uid):
-    """If `uid` is committed to a game in a DIFFERENT lobby, return a refusal
-    message (they can't queue anywhere until that game ends). Else None."""
-    if len(lobbies) < 2:
+    """If `uid` is committed to a game in a DIFFERENT lobby OF THE SAME SERVER,
+    return a refusal message (one game at a time is a per-server rule). Else
+    None. Servers are fully isolated, so a game in another server never blocks."""
+    key = _cur_key.get()
+    sub = guild_lobbies(ctx_for_key(key))
+    if len(sub) < 2:
         return None
-    home = blocking_cid(lobbies, uid, _cur_key.get())
+    home = blocking_cid(sub, uid, key)
     if home is None:
         return None
     ch = _lobby_channels.get(home)
@@ -170,11 +272,13 @@ def cross_block_msg(uid):
 
 async def after_commit(home_channel, home_guild):
     """Enforce one-game-at-a-time after any change that may commit a player:
-    pull committed players out of every OTHER lobby, notify those channels, and
-    re-render them (a mid-check pull backfills and may re-fire that check)."""
-    if len(lobbies) < 2:
+    pull committed players out of every OTHER lobby of the SAME server, notify
+    those channels, and re-render them (a mid-check pull backfills and may re-fire
+    that check). Scoped per server, so servers never pull from each other."""
+    sub = guild_lobbies(ctx_for_key(_cur_key.get()))
+    if len(sub) < 2:
         return
-    changed, _notes = reconcile(lobbies)
+    changed, _notes = reconcile(sub)
     for key, uids in changed.items():
         ch = _lobby_channels.get(key)
         if ch is None:
@@ -199,33 +303,34 @@ async def after_commit(home_channel, home_guild):
             _cur_key.reset(token)
 
 # ---------- persistence ----------
-store = Store(os.environ.get("PUG_DB", "pug.db"))
-_last_saved = None           # last snapshot we wrote (skip redundant writes)
 _resumed = False             # one-shot guard (on_ready can fire on reconnects)
 
 
 def persist():
-    """Write a snapshot of every lobby (+ shared immunity + the channel each game
-    lives in) if it changed. Cheap and called on a timer, so a missed handler
-    can never lose much."""
-    global _last_saved
-    payload = {
-        "v": 2,
-        "immunity": SHARED_IMMUNITY,
-        "stats": SHARED_STATS,
-        "fake_names": FAKE_NAMES,
-        "lobbies": {
-            str(key): {
-                "state": st.to_dict(),
-                "channel_id": (_lobby_channels[key].id
-                               if _lobby_channels.get(key) is not None else None),
-            }
-            for key, st in lobbies.items()
-        },
-    }
-    blob = json.dumps(payload, sort_keys=True)
-    if blob != _last_saved and store.save(payload):
-        _last_saved = blob
+    """Write each server's snapshot to its OWN store if it changed (its lobbies +
+    that server's shared immunity/stats + the channel each game lives in). Cheap
+    and called on a timer, so a missed handler can never lose much."""
+    for c in all_ctxs:
+        keys = list(guild_lobbies(c).keys())
+        if not keys:
+            continue
+        payload = {
+            "v": 2,
+            "immunity": c.immunity,
+            "stats": c.stats,
+            "fake_names": FAKE_NAMES,
+            "lobbies": {
+                str(key): {
+                    "state": lobbies[key].to_dict(),
+                    "channel_id": (_lobby_channels[key].id
+                                   if _lobby_channels.get(key) is not None else None),
+                }
+                for key in keys
+            },
+        }
+        blob = json.dumps(payload, sort_keys=True)
+        if blob != c.last_saved and c.store.save(payload):
+            c.last_saved = blob
 
 
 # ---------- name + display helpers ----------
@@ -263,6 +368,34 @@ def skill_label(guild, uid) -> str:
         if key in have:
             return label
     return ""
+
+
+def tier_of(guild, uid) -> int:
+    """A player's draft tier (1/2/3) from their Discord roles, for a tiered guild.
+    A member with none OR multiple of the tier roles falls back to TIER_FALLBACK.
+    Bots (debug) are treated as the fallback tier too."""
+    member = guild.get_member(uid) if guild else None
+    if not member:
+        return TIER_FALLBACK
+    have = {r.name.lower() for r in member.roles}
+    matched = [t for names, t in TIER_ROLES if have & set(names)]
+    return matched[0] if len(matched) == 1 else TIER_FALLBACK
+
+
+def tier_block(guild, target) -> Optional[str]:
+    """Hard tiered-draft guard. On a tiered guild, a player of tier T can't be
+    picked while any UNPICKED player of a lower tier remains. Returns a refusal
+    message, or None if the pick is allowed (or the guild isn't tiered)."""
+    if not ctx().tiered:
+        return None
+    tiers = [tier_of(guild, u) for u in pug.unpicked()]
+    if not tiers:
+        return None
+    lowest = min(tiers)
+    if tier_of(guild, target) > lowest:
+        return (f"Tiered draft: all **{TIER_NAMES.get(lowest, f'tier {lowest}')}** "
+                "players must be picked before higher tiers.")
+    return None
 
 
 def fuzzy_unpicked(name, guild):
@@ -376,9 +509,13 @@ def draft_embed(guild) -> discord.Embed:
             tag = player_tag(guild, u)
             skill = skill_label(guild, u)
             imm = pug.immunity.get(u)
-            elo = SHARED_STATS.get(u, {}).get("elo", ELO_START)
-            extra = f" ({elo})"
-            extra += f" · {skill}" if skill else ""
+            extra = ""
+            if ctx().elo:
+                extra += f" ({ctx().stats.get(u, {}).get('elo', ELO_START)})"
+            if ctx().tiered:
+                extra += f" · {TIER_NAMES.get(tier_of(guild, u), '?')}"
+            elif skill:
+                extra += f" · {skill}"
             extra += f" — **IMMUNE: x{imm}**" if imm else ""
             lines.append(tag + extra)
     lines.append("—")
@@ -402,22 +539,24 @@ def _team_avg_elo(color):
     members = ([capt] if capt else []) + list(pug.team[color])
     if not members:
         return None
-    total = sum(SHARED_STATS.get(u, {}).get("elo", ELO_START) for u in members)
+    total = sum(ctx().stats.get(u, {}).get("elo", ELO_START) for u in members)
     return round(total / len(members))
 
 
 def final_embed(guild) -> discord.Embed:
     dot = {"RED": "🔴", "BLU": "🔵"}
     lines = []
+    show_elo = ctx().elo
     for color in ("RED", "BLU"):
-        avg = _team_avg_elo(color)
         header = f"{dot[color]} **{color}**"
-        if avg is not None:
-            header += f" — avg {avg} Elo"
+        if show_elo:
+            avg = _team_avg_elo(color)
+            if avg is not None:
+                header += f" — avg {avg} Elo"
         lines.append(header)
         lines.append(team_roster(guild, color))
     lines.append("—")
-    connect = f"<#{CONNECT_CHANNEL_ID}>" if CONNECT_CHANNEL_ID else "#connect-string"
+    connect = f"<#{ctx().connect_channel_id}>" if ctx().connect_channel_id else "#connect-string"
     lines.append(f"➡️ Head to {connect} to join the server.")
     lines.append("When it's over: **/match report red** or **/match report blu**.")
     lines.append("Admins: **/match cancel** to void a game with no result.")
@@ -426,11 +565,10 @@ def final_embed(guild) -> discord.Embed:
                          color=discord.Color.green())
 
 
-def _snapshot_db_sync(dst):
-    """Write a *consistent* copy of pug.db to dst using SQLite's backup API, which
-    is safe even if a write is happening at the same moment (unlike a raw file
-    copy, which could catch a half-written page). Runs in a worker thread."""
-    src = os.environ.get("PUG_DB", "pug.db")
+def _snapshot_db_sync(src, dst):
+    """Write a *consistent* copy of the given DB to dst using SQLite's backup API,
+    which is safe even if a write is happening at the same moment (unlike a raw
+    file copy, which could catch a half-written page). Runs in a worker thread."""
     con = sqlite3.connect(src)
     bck = sqlite3.connect(dst)
     try:
@@ -442,25 +580,28 @@ def _snapshot_db_sync(dst):
 
 
 async def backup_db(reason=""):
-    """Snapshot pug.db and upload it to the backup channel. Returns (ok, info).
-    Never raises — a failed backup should never break the flow that triggered it."""
-    if not BACKUP_CHANNEL_ID:
+    """Snapshot the CURRENT server's DB and upload it to that server's backup
+    channel. Returns (ok, info). Never raises — a failed backup should never break
+    the flow that triggered it."""
+    c = ctx()
+    if not c.backup_channel_id:
         return False, "no backup channel configured"
-    ch = client.get_channel(BACKUP_CHANNEL_ID)
+    ch = client.get_channel(c.backup_channel_id)
     if ch is None:
         try:
-            ch = await client.fetch_channel(BACKUP_CHANNEL_ID)
+            ch = await client.fetch_channel(c.backup_channel_id)
         except discord.HTTPException:
-            print(f"[backup] channel {BACKUP_CHANNEL_ID} not found / no access")
+            print(f"[backup] channel {c.backup_channel_id} not found / no access")
             return False, "backup channel not found or bot has no access"
     fd, tmp = tempfile.mkstemp(suffix=".db", prefix="pugbak_")
     os.close(fd)
+    stem = os.path.splitext(os.path.basename(c.db_path))[0] or "pug"
     try:
-        await asyncio.to_thread(_snapshot_db_sync, tmp)
+        await asyncio.to_thread(_snapshot_db_sync, c.db_path, tmp)
         ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d_%H%M")
         note = f" · {reason}" if reason else ""
-        await ch.send(content=f"🗄️ `pug.db` backup — {ts} UTC{note}",
-                      file=discord.File(tmp, filename=f"pug-{ts}.db"))
+        await ch.send(content=f"🗄️ `{os.path.basename(c.db_path)}` backup — {ts} UTC{note}",
+                      file=discord.File(tmp, filename=f"{stem}-{ts}.db"))
         return True, ts
     except (discord.HTTPException, OSError, sqlite3.Error) as e:
         print(f"[backup] failed: {e}")
@@ -473,14 +614,18 @@ async def backup_db(reason=""):
 
 
 def results_embed(guild, mid, detail) -> discord.Embed:
-    """The post-report card: which team won and each player's Elo before → after.
-    `detail` is PugState.last_result (in-memory, int-keyed). Deliberately NOT a
-    monospace code block — those wrap badly on mobile; a plain list reads cleaner."""
+    """The post-report card. On an Elo guild it shows each player's Elo
+    before → after; on a no-Elo guild (detail['no_elo']) it just lists the
+    rosters under each side. Deliberately NOT a monospace code block — those
+    wrap badly on mobile; a plain list reads cleaner."""
     winner = detail["winner"]
     elos = detail["elos"]                       # {uid: [before, after]}
+    no_elo = detail.get("no_elo")
     dots = {"RED": "🔴", "BLU": "🔵"}
 
     def line(u):
+        if no_elo:
+            return f"`{display_name(guild, u)}`"
         before, after = elos[u]
         return f"`{display_name(guild, u)}` {before} → **{after}**  ({after - before:+d})"
 
@@ -639,7 +784,10 @@ class PugTree(app_commands.CommandTree):
         # and enforce the channel lock. Text commands bind in on_message.
         key = lobby_key_for(interaction.channel_id) if interaction.channel_id else False
         if key is False:
-            where = " ".join(f"<#{c}>" for c in PUG_CHANNEL_IDS) or "the PUG channel"
+            here = [c for c in PUG_CHANNEL_IDS
+                    if interaction.guild is not None
+                    and interaction.guild.get_channel(c) is not None]
+            where = " ".join(f"<#{c}>" for c in (here or PUG_CHANNEL_IDS)) or "the PUG channel"
             await interaction.response.send_message(
                 f"PUGs only run in {where} — use the bot there.", ephemeral=True)
             return False
@@ -655,29 +803,31 @@ class PugClient(discord.Client):
         self.tree = PugTree(self)
 
     async def setup_hook(self):
-        global _last_saved
-        # restore any persisted state before we start taking commands
-        saved = store.load()
-        if saved and saved.get("lobbies"):
-            SHARED_IMMUNITY.clear()
-            SHARED_IMMUNITY.update(
+        # restore each server's persisted state from its OWN store before we start
+        # taking commands. Servers are isolated: one store/snapshot per GuildCtx.
+        for c in all_ctxs:
+            saved = c.store.load()
+            if not (saved and saved.get("lobbies")):
+                continue
+            c.immunity.clear()
+            c.immunity.update(
                 {int(k): int(v) for k, v in (saved.get("immunity") or {}).items()})
-            SHARED_STATS.clear()
-            SHARED_STATS.update(
+            c.stats.clear()
+            c.stats.update(
                 {int(k): {"games": int(v.get("games", 0)), "capt": int(v.get("capt", 0)),
                           "w": int(v.get("w", 0)), "l": int(v.get("l", 0)),
                           "d": int(v.get("d", 0)), "elo": int(v.get("elo", ELO_START))}
                  for k, v in (saved.get("stats") or {}).items()})
             for k_str, lob in saved["lobbies"].items():
                 key = _SINGLE if k_str == "None" else int(k_str)
-                if key not in lobbies:
-                    continue                       # config changed; ignore unknown lobby
+                if key not in lobbies or ctx_for_key(key) is not c:
+                    continue                   # config changed; ignore unknown lobby
                 lobbies[key].load_dict(lob.get("state", {}))
                 cid = lob.get("channel_id")
                 if cid is not None:
                     _resume_keys[key] = cid
             FAKE_NAMES.update({int(k): v for k, v in (saved.get("fake_names") or {}).items()})
-            _last_saved = json.dumps(saved, sort_keys=True)
+            c.last_saved = json.dumps(saved, sort_keys=True)
         gid = os.environ.get("TEST_GUILD_ID")
         if gid:
             guild = discord.Object(id=int(gid))
@@ -742,24 +892,26 @@ class PugClient(discord.Client):
         shows up in the console instead of failing invisibly."""
         if member.bot:
             return
+        ping_role = _ctx_by_gid.get(member.guild.id, DEFAULT_CTX).ping_role
         role = discord.utils.find(
-            lambda r: r.name.lower() == PUG_PING_ROLE.lower(), member.guild.roles)
+            lambda r: r.name.lower() == ping_role.lower(), member.guild.roles)
         if role is None:
-            print(f"[on_member_join] no role named '{PUG_PING_ROLE}' in "
+            print(f"[on_member_join] no role named '{ping_role}' in "
                   f"{member.guild.name} — nothing assigned to {member}")
             return
         try:
-            await member.add_roles(role, reason="Auto-assign Puggers on join")
+            await member.add_roles(role, reason="Auto-assign rally role on join")
             print(f"[on_member_join] gave '{role.name}' to {member} ({member.id})")
         except discord.Forbidden:
             print(f"[on_member_join] FORBIDDEN adding '{role.name}' to {member} — "
-                  "give the bot Manage Roles and move its role ABOVE Puggers")
+                  "give the bot Manage Roles and move its role ABOVE the rally role")
         except discord.HTTPException as e:
             print(f"[on_member_join] HTTP error adding '{role.name}' to {member}: {e}")
 
     async def close(self):
         persist()                        # final flush on graceful shutdown
-        store.close()
+        for c in all_ctxs:
+            c.store.close()
         await super().close()
 
     async def on_message(self, message):
@@ -945,6 +1097,10 @@ async def capfor_cmd(interaction: discord.Interaction, team: app_commands.Choice
 @client.tree.command(name="pick", description="Draft a player (current picker only).")
 @app_commands.describe(player="Who to pick")
 async def pick_cmd(interaction: discord.Interaction, player: discord.Member):
+    blocked = tier_block(interaction.guild, player.id)   # server-2 tiered draft guard
+    if blocked:
+        await interaction.response.send_message(blocked, ephemeral=True)
+        return
     ok, msg = pug.pick(interaction.user.id, player.id)
     if not ok:
         await interaction.response.send_message(msg, ephemeral=True)
@@ -980,14 +1136,25 @@ match_group = app_commands.Group(name="match", description="Match controls.")
 ])
 async def match_report_cmd(interaction: discord.Interaction,
                            winner: app_commands.Choice[str]):
+    c = ctx()
+    # on a no-Elo server, keep W/L/D but never let ratings drift: snapshot the
+    # live roster's Elo, then restore it after the (Elo-computing) report call.
+    pre_elo = ({u: c.stats.get(u, {}).get("elo", ELO_START) for u in pug.queue_ids()}
+               if not c.elo else None)
     ok, msg, pinged = pug.match_report(interaction.user.id, is_admin(interaction.user),
                                        winner=winner.value)
     if not ok:
         await interaction.response.send_message(msg, ephemeral=True)
         return
-    # a recorded game is written to the append-only audit log and tagged with its id
     result = pug.last_result
-    mid = (store.log_event("match", {**result, "channel_id": interaction.channel.id})
+    if result and pre_elo is not None:                # no-Elo server: freeze ratings
+        for u, e in pre_elo.items():
+            if u in c.stats:
+                c.stats[u]["elo"] = e
+        result = {**result, "delta": 0, "no_elo": True,
+                  "elos": {u: [pre_elo.get(u, ELO_START)] * 2 for u in result["elos"]}}
+    # a recorded game is written to the append-only audit log and tagged with its id
+    mid = (c.store.log_event("match", {**result, "channel_id": interaction.channel.id})
            if result else None)
     embed = results_embed(interaction.guild, mid, result)
     embed.set_footer(text="Queue open — /add to join.")
@@ -1067,7 +1234,7 @@ async def match_sub_cmd(interaction: discord.Interaction,
 
 @match_group.command(name="log", description="Show the most recent reported matches.")
 async def match_log_cmd(interaction: discord.Interaction):
-    events = store.recent_events(limit=10, kind="match")
+    events = ctx().store.recent_events(limit=10, kind="match")
     if not events:
         await interaction.response.send_message("No matches recorded yet.")
         return
@@ -1077,8 +1244,8 @@ async def match_log_cmd(interaction: discord.Interaction):
         win = d.get("winner", "?")
         dot = {"RED": "🔴", "BLU": "🔵"}.get(win, "🤝")
         label = "Draw" if win == "DRAW" else f"{win} win"
-        lines.append(f"**#{e['id']}** {dot} {label} · Δ{d.get('delta', 0)} · "
-                     f"{_ago(e['ts'])}")
+        swing = "" if d.get("no_elo") else f" · Δ{d.get('delta', 0)}"
+        lines.append(f"**#{e['id']}** {dot} {label}{swing} · {_ago(e['ts'])}")
     await interaction.response.send_message(
         "🗒️ **Recent matches** (use `/match info <id>` for detail)\n" + "\n".join(lines))
 
@@ -1086,19 +1253,20 @@ async def match_log_cmd(interaction: discord.Interaction):
 @match_group.command(name="info", description="Show the detail of one recorded match by its id.")
 @app_commands.describe(match_id="The match number (see /match log)")
 async def match_info_cmd(interaction: discord.Interaction, match_id: int):
-    e = store.get_event(match_id)
+    e = ctx().store.get_event(match_id)
     if e is None or e.get("kind") != "match":
         await interaction.response.send_message(f"No match #{match_id}.", ephemeral=True)
         return
     d = e["data"]
     elos = d.get("elos", {})
+    show_elo = not d.get("no_elo")
 
     def side(color):
         out = []
         for uid in d.get(color.lower(), []):
             ba = elos.get(str(uid)) or elos.get(uid)        # keys are strings after JSON
             tag = name_box(interaction.guild, uid)
-            if ba:
+            if ba and show_elo:
                 out.append(f"{tag} ({ba[0]}→{ba[1]})")
             else:
                 out.append(tag)
@@ -1107,8 +1275,8 @@ async def match_info_cmd(interaction: discord.Interaction, match_id: int):
     win = d.get("winner", "?")
     dot = {"RED": "🔴", "BLU": "🔵", "DRAW": "🤝"}
     label = "**Draw**" if win == "DRAW" else f"**{win} win**"
-    lines = [f"**Match #{e['id']}** · {dot.get(win, '')} {label} · "
-             f"swing Δ{d.get('delta', 0)} · {_ago(e['ts'])}",
+    swing = f" · swing Δ{d.get('delta', 0)}" if show_elo else ""
+    lines = [f"**Match #{e['id']}** · {dot.get(win, '')} {label}{swing} · {_ago(e['ts'])}",
              f"🔴 RED: {side('RED')}",
              f"🔵 BLU: {side('BLU')}"]
     await interaction.response.send_message("\n".join(lines))
@@ -1126,7 +1294,8 @@ async def match_fix_cmd(interaction: discord.Interaction,
     if not is_admin(interaction.user):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
-    e = store.get_event(match_id)
+    c = ctx()
+    e = c.store.get_event(match_id)
     if e is None or e.get("kind") != "match":
         await interaction.response.send_message(f"No match #{match_id}.", ephemeral=True)
         return
@@ -1149,14 +1318,24 @@ async def match_fix_cmd(interaction: discord.Interaction,
                 f"Match #{match_id} is missing rating data — can't auto-fix.", ephemeral=True)
             return
         before[u] = ba[0]
+    # no-Elo server: correct W/L/D but freeze ratings (snapshot + restore)
+    pre_elo = ({u: c.stats.get(u, {}).get("elo", ELO_START) for u in red + blu}
+               if not c.elo else None)
     detail = pug.correct_match(red, blu, before, old_winner, new_winner)
-    store.log_event("correction", {"match_id": match_id, "from": old_winner,
-                                   "to": new_winner, "by": interaction.user.id})
+    if pre_elo is not None:
+        for u, val in pre_elo.items():
+            if u in c.stats:
+                c.stats[u]["elo"] = val
+        detail = {**detail, "delta": 0, "no_elo": True,
+                  "elos": {u: [pre_elo.get(u, ELO_START)] * 2 for u in detail["elos"]}}
+    c.store.log_event("correction", {"match_id": match_id, "from": old_winner,
+                                     "to": new_winner, "by": interaction.user.id})
     embed = results_embed(interaction.guild, match_id, detail)
     was = "Draw" if old_winner == "DRAW" else f"{old_winner} win"
     now = "Draw" if new_winner == "DRAW" else f"{new_winner} win"
     embed.title = f"Match #{match_id} corrected — {now} (was {was})"
-    embed.set_footer(text="Elo and W/L/D updated automatically.")
+    embed.set_footer(text=("W/L/D updated automatically." if pre_elo is not None
+                           else "Elo and W/L/D updated automatically."))
     await interaction.response.send_message(embed=embed)
 
 
@@ -1273,7 +1452,7 @@ async def clear_cmd(interaction: discord.Interaction):
 # ---------- slash: info ----------
 @client.tree.command(name="captstat", description="Top 10 players by times rolled as captain.")
 async def captstat_cmd(interaction: discord.Interaction):
-    rows = [(uid, rec) for uid, rec in SHARED_STATS.items()
+    rows = [(uid, rec) for uid, rec in ctx().stats.items()
             if uid not in FAKE_NAMES and rec.get("capt", 0) > 0]
     rows.sort(key=lambda r: (-r[1].get("capt", 0), -r[1].get("games", 0)))
     if not rows:
@@ -1287,11 +1466,12 @@ async def captstat_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("🏅 **Most-rolled captains**\n" + "\n".join(lines))
 
 
-@client.tree.command(name="stat", description="Show a player's Elo, record, and games.")
+@client.tree.command(name="stat", description="Show a player's record, games, and (where enabled) Elo.")
 @app_commands.describe(player="(optional) whose stats to show — defaults to you")
 async def stat_cmd(interaction: discord.Interaction, player: Optional[discord.Member] = None):
     member = player or interaction.user
-    rec = SHARED_STATS.get(member.id) or {}
+    show_elo = ctx().elo
+    rec = ctx().stats.get(member.id) or {}
     g = rec.get("games", 0)
     if g == 0:
         empty = discord.Embed(
@@ -1309,10 +1489,10 @@ async def stat_cmd(interaction: discord.Interaction, player: Optional[discord.Me
 
     # Elo rank among everyone who's played (bots excluded)
     ranked = sorted(
-        (u for u, r in SHARED_STATS.items()
+        (u for u, r in ctx().stats.items()
          if u not in FAKE_NAMES and r.get("games", 0) > 0),
-        key=lambda u: (-SHARED_STATS[u].get("elo", ELO_START),
-                       -SHARED_STATS[u].get("games", 0)))
+        key=lambda u: (-ctx().stats[u].get("elo", ELO_START),
+                       -ctx().stats[u].get("games", 0)))
     rank = ranked.index(member.id) + 1 if member.id in ranked else None
 
     embed = discord.Embed(
@@ -1320,14 +1500,16 @@ async def stat_cmd(interaction: discord.Interaction, player: Optional[discord.Me
         color=discord.Color.blurple())
     if member.id not in FAKE_NAMES:
         embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Elo", value=f"**{elo}**", inline=True)
+    if show_elo:
+        embed.add_field(name="Elo", value=f"**{elo}**", inline=True)
     embed.add_field(name="Record", value=f"{w}W – {l}L – {dr}D", inline=True)
     embed.add_field(name="Win rate", value=wr, inline=True)
     embed.add_field(name="Games", value=str(g), inline=True)
     embed.add_field(name="Captain", value=capt_val, inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=True)   # keep the 3-col grid tidy
-    if rank is not None:
-        embed.set_footer(text=f"Elo rank #{rank} of {len(ranked)}")
+    if show_elo:
+        embed.add_field(name="\u200b", value="\u200b", inline=True)   # keep the 3-col grid tidy
+        if rank is not None:
+            embed.set_footer(text=f"Elo rank #{rank} of {len(ranked)}")
     await interaction.response.send_message(embed=embed)
 
 
@@ -1336,7 +1518,7 @@ elo_group = app_commands.Group(name="elo", description="Ratings.")
 
 def _elo_ranked():
     """All rated players (bots excluded, at least one game), best Elo first."""
-    rows = [(uid, rec) for uid, rec in SHARED_STATS.items()
+    rows = [(uid, rec) for uid, rec in ctx().stats.items()
             if uid not in FAKE_NAMES and rec.get("games", 0) > 0]
     rows.sort(key=lambda r: (-r[1].get("elo", ELO_START), -r[1].get("games", 0)))
     return rows
@@ -1344,6 +1526,9 @@ def _elo_ranked():
 
 @elo_group.command(name="top", description="Top 10 players by Elo rating.")
 async def elo_top_cmd(interaction: discord.Interaction):
+    if not ctx().elo:
+        await interaction.response.send_message("Elo is disabled on this server.", ephemeral=True)
+        return
     ranked = _elo_ranked()
     if not ranked:
         await interaction.response.send_message(
@@ -1359,6 +1544,9 @@ async def elo_top_cmd(interaction: discord.Interaction):
 
 @elo_group.command(name="bottom", description="Bottom 10 players by Elo rating.")
 async def elo_bottom_cmd(interaction: discord.Interaction):
+    if not ctx().elo:
+        await interaction.response.send_message("Elo is disabled on this server.", ephemeral=True)
+        return
     ranked = _elo_ranked()
     if not ranked:
         await interaction.response.send_message(
@@ -1383,10 +1571,13 @@ async def elo_set_cmd(interaction: discord.Interaction,
     if not is_admin(interaction.user):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
+    if not ctx().elo:
+        await interaction.response.send_message("Elo is disabled on this server.", ephemeral=True)
+        return
     ok, msg, before, after = pug.set_elo(player.id, rating)
-    store.log_event("elo_adjust", {"mode": "set", "uid": player.id,
-                                   "by": interaction.user.id,
-                                   "before": before, "after": after})
+    ctx().store.log_event("elo_adjust", {"mode": "set", "uid": player.id,
+                                         "by": interaction.user.id,
+                                         "before": before, "after": after})
     await interaction.response.send_message(msg)
 
 
@@ -1397,10 +1588,13 @@ async def elo_add_cmd(interaction: discord.Interaction,
     if not is_admin(interaction.user):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
+    if not ctx().elo:
+        await interaction.response.send_message("Elo is disabled on this server.", ephemeral=True)
+        return
     ok, msg, before, after = pug.add_elo(player.id, amount)
-    store.log_event("elo_adjust", {"mode": "add", "uid": player.id,
-                                   "by": interaction.user.id, "amount": int(amount),
-                                   "before": before, "after": after})
+    ctx().store.log_event("elo_adjust", {"mode": "add", "uid": player.id,
+                                         "by": interaction.user.id, "amount": int(amount),
+                                         "before": before, "after": after})
     await interaction.response.send_message(msg)
 
 
@@ -1442,9 +1636,10 @@ async def promote_cmd(interaction: discord.Interaction):
             f"`/promote` is on cooldown — try again in {int(remaining) + 1}s.", ephemeral=True)
         return
     _last_promote[key] = time.monotonic()
+    ping_role = ctx().ping_role
     role = discord.utils.find(
-        lambda r: r.name.lower() == PUG_PING_ROLE.lower(), interaction.guild.roles)
-    mention = role.mention if role else f"@{PUG_PING_ROLE}"
+        lambda r: r.name.lower() == ping_role.lower(), interaction.guild.roles)
+    mention = role.mention if role else f"@{ping_role}"
     await interaction.response.send_message(
         f"{mention} There are **{needed}** more player(s) required to start the 6v6 pug. "
         "Type `/add` or `++` to join!",
@@ -1467,6 +1662,14 @@ async def queue_cmd(interaction: discord.Interaction):
 
 @client.tree.command(name="commands", description="Show the command list.")
 async def commands_cmd(interaction: discord.Interaction):
+    elo_on = ctx().elo
+    stat_line = ("`/captstat` — top 10 most-rolled captains · `/elo top` — top 10 by rating\n"
+                 "`/elo bottom` — bottom 10 by rating\n"
+                 "`/stat [@user]` — a player's Elo, W/L, win rate + captaincies\n"
+                 if elo_on else
+                 "`/captstat` — top 10 most-rolled captains\n"
+                 "`/stat [@user]` — a player's W/L, win rate + captaincies\n")
+    elo_admin_line = "`/elo set|add @player` — admin: correct a rating\n" if elo_on else ""
     text = (
         "**TF2 PUG — commands**\n"
         "`/add` or `++` — join (2-min auto-ready)\n"
@@ -1478,9 +1681,7 @@ async def commands_cmd(interaction: discord.Interaction):
         "`/queue` — show queue or teams\n"
         "`/promote` — ping the pugger role for more players\n"
         "`/tosscoin` — flip a coin (heads/tails)\n"
-        "`/captstat` — top 10 most-rolled captains · `/elo top` — top 10 by rating\n"
-        "`/elo bottom` — bottom 10 by rating\n"
-        "`/stat [@user]` — a player's Elo, W/L, win rate + captaincies\n"
+        + stat_line +
         "`/capfor red|blu` — volunteer to captain · `/capoff` — step down\n"
         "`/pick @user` — draft a player\n"
         "`/subme` — request a sub (run again to cancel) · `/subfor` — sub in (draft or live)\n"
@@ -1491,7 +1692,7 @@ async def commands_cmd(interaction: discord.Interaction):
         "`/match put @player red|blu|capt red|capt blu|bench` — admin: move a player to a team, a captain slot, or the bench\n"
         "`/match start` — admin: force a fully-set draft to go live\n"
         "`/immunity show|set|add|clear` — admin: manage med immunity\n"
-        "`/elo set|add @player` — admin: correct a rating\n"
+        + elo_admin_line +
         "`/reset` · `/clear` · `/forceadd` — admin\n"
         "\n*While a game is live, new joins line up in the **next queue** and start once it's reported.*"
     )
@@ -1670,6 +1871,10 @@ if DEBUG:
         if target is None:
             await interaction.response.send_message(
                 f"No unpicked player matches “{name}”.", ephemeral=True)
+            return
+        blocked = tier_block(interaction.guild, target)   # server-2 tiered draft guard
+        if blocked:
+            await interaction.response.send_message(blocked, ephemeral=True)
             return
         # pick as the caller -> the turn guard rejects if it isn't their turn
         ok, msg = pug.pick(interaction.user.id, target)

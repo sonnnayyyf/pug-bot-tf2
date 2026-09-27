@@ -133,6 +133,7 @@ Configuration is read from environment variables, loaded from a local `.env` fil
 | `PUG_CHANNEL_ID` | no | One channel ID locks the bot to that channel. **Two or more IDs** (comma- or space-separated) run that many independent games, one per channel. Unset = responds everywhere as one game. (`PUG_CHANNEL_IDS` is accepted as an alias.) |
 | `CONNECT_CHANNEL_ID` | no | Channel ID shown as a clickable link on the live teams embed ("head to #connect-string"). |
 | `PUG_DB` | no | Path to the SQLite state file (default `pug.db`). |
+| `PUG_GUILDS` | no | JSON list adding **extra, fully-isolated Discord servers** (own DB file, stats, immunity, backup channel, ping role, and rule flags). See *Multiple servers* below. |
 | `PUG_DEBUG` | no | Set to `1` to enable the debug commands. |
 
 Create a `.env` file in the project root:
@@ -156,6 +157,37 @@ PUG_DEBUG=1 python bot.py
 
 **Never commit your token.** The `.env` file is git-ignored (see below).
 
+### Multiple servers
+
+The classic env vars above configure **server 1** (Elo on, no draft tiers, DB
+`pug.db`). To run one or more **additional, fully-isolated servers** from the same
+process, set `PUG_GUILDS` to a JSON list — one object per server. Each server gets
+its own SQLite file, stats, med immunity, backup channel, rally-ping role, and
+rule flags; nothing is shared between servers, and server 1's `pug.db` is never
+touched.
+
+```
+PUG_GUILDS=[{"guild_id": 1546370985320648735,
+             "channels": [1553780642167267388],
+             "db": "treepug.db",
+             "backup_channel_id": 1553780865090326558,
+             "connect_channel_id": 1546391663906394162,
+             "ping_role": "Puggers",
+             "tiered": true,
+             "elo": false}]
+```
+
+Per-server keys: `guild_id` (used for per-guild lookups like auto-role on join),
+`channels` (each an independent lobby), `db` (its SQLite file), and the optional
+`backup_channel_id` / `connect_channel_id` / `ping_role` / `tiered` / `elo`.
+
+- **`tiered: true`** — a hard draft restriction from Discord roles: a higher tier
+  can't be picked until every lower-tier player is drafted. Tier 1 = **Seed** /
+  **Sprout** (unrestricted), Tier 2 = **Tree**, Tier 3 = **Elder Tree** (picked
+  last). A player with none or multiple of these roles is treated as Tier 1.
+- **`elo: false`** — drops the Elo number/ranking (and `/elo top|bottom|set|add`)
+  while keeping W/L/D, win rate, and captain counts.
+
 A minimal `.gitignore`:
 
 ```
@@ -163,6 +195,9 @@ A minimal `.gitignore`:
 pug.db
 pug.db-journal
 pug.db-wal
+*.db
+*.db-journal
+*.db-wal
 __pycache__/
 *.pyc
 .vscode/
