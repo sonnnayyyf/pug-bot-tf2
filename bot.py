@@ -435,8 +435,8 @@ def is_admin(member) -> bool:
     perms = getattr(member, "guild_permissions", None)
     if perms and perms.administrator:
         return True
-    allowed = ctx().admin_roles                  # per-server admin role names
-    return any(r.name in allowed for r in getattr(member, "roles", []))
+    allowed = {r.strip().lower() for r in ctx().admin_roles}   # per-server admin roles
+    return any(r.name.strip().lower() in allowed for r in getattr(member, "roles", []))
 
 
 def fmt_dur(seconds: int) -> str:
