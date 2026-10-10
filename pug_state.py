@@ -636,6 +636,7 @@ class PugState:
     def _swap(self, out_uid, in_uid):
         if out_uid in self.queue:
             self.queue[in_uid] = self.queue.pop(out_uid)
+        self.next_queue.pop(in_uid, None)     # incoming player joins the game, not the next queue
         self.ready.discard(out_uid)
         for color in ("RED", "BLU"):
             if out_uid in self.team[color]:
@@ -931,6 +932,21 @@ if __name__ == "__main__":
     assert s2.sub_for(inc)[0] is True
     assert s2._stat_rec(inc)["games"] == 1 and s2.immunity.get(inc) == IMMUNITY_GAMES
     print("G2) admin_sub works w/o request; live subs get game + immunity")
+
+    # G3) a player waiting in the next queue who subs into the live game is pulled
+    #     out of the next queue (can't be in the current game AND waiting for the next)
+    s3 = fresh(); fill(s3, P); drive_draft(s3)             # LIVE
+    s3.add(101); s3.add(102)                               # two waiting in the next queue
+    assert 101 in s3.next_queue
+    s3.request_sub(next(iter(s3.queue)))
+    assert s3.sub_for(101)[0] is True                      # 101 subs in
+    assert 101 in s3.queue and 101 not in s3.next_queue    # no longer waiting
+    assert 102 in s3.next_queue                            # the other waiter untouched
+    # admin_sub does the same
+    s3.request_sub(next(iter(s3.queue)))
+    assert s3.admin_sub(next(iter(s3.sub_requests)), 102)[0] is True
+    assert 102 in s3.queue and 102 not in s3.next_queue
+    print("G3) subbing in from the next queue removes the player from it")
 
     # H) anyone (not just the rolled captains) can volunteer to captain,
     #    and immunity follows whoever actually captained
