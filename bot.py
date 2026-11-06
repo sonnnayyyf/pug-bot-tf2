@@ -232,11 +232,28 @@ def guild_lobbies(c):
     return {k: st for k, st in lobbies.items() if ctx_for_key(k) is c}
 
 
+# Each server's backup channel also accepts commands, driving that server's first
+# lobby. Announcements still go to the real lobby channel (see _remember_channel).
+_alias_keys = {}                 # backup channel_id -> lobby key
+if PUG_CHANNEL_IDS:
+    for _c in all_ctxs:
+        _gl = guild_lobbies(_c)
+        if _c.backup_channel_id and _gl and _c.backup_channel_id not in lobbies:
+            _alias_keys[int(_c.backup_channel_id)] = next(iter(_gl))
+
+
 def lobby_key_for(channel_id):
     """Channel id -> its lobby key, or False if it isn't a PUG channel."""
     if PUG_CHANNEL_IDS:
-        return channel_id if channel_id in PUG_CHANNEL_IDS else False
+        if channel_id in PUG_CHANNEL_IDS:
+            return channel_id
+        return _alias_keys.get(channel_id, False)
     return _SINGLE                # single shared lobby, responds in any channel
+
+
+def _remember_channel(key, channel):
+    if channel.id not in _alias_keys:     # never repoint a lobby at its backup channel
+        _lobby_channels[key] = channel
 
 
 def _enter(channel):
@@ -246,7 +263,7 @@ def _enter(channel):
     if key is False:
         return None
     _cur_key.set(key)
-    _lobby_channels[key] = channel
+    _remember_channel(key, channel)
     return lobbies[key]
 
 
@@ -805,7 +822,7 @@ class PugTree(app_commands.CommandTree):
             return False
         _cur_key.set(key)
         if interaction.channel is not None:
-            _lobby_channels[key] = interaction.channel
+            _remember_channel(key, interaction.channel)
         return True
 
 
