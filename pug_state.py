@@ -813,6 +813,42 @@ class PugState:
         return True, "Queue cleared."
 
 
+def rebuild_stats(events, freeze_elo=False):
+    """Replay the audit log (oldest first: match / correction / elo_adjust events
+    as {id, kind, data}) into a fresh stats dict. A side's first listed player is
+    its captain. Returns (stats, matches_replayed). With freeze_elo, ratings are
+    left at ELO_START (servers where Elo is off)."""
+    st = PugState(stats={})
+    matches = {}
+    n = 0
+    for e in events:
+        d = e["data"]
+        if e["kind"] == "match":
+            red, blu = [int(u) for u in d.get("red", [])], [int(u) for u in d.get("blu", [])]
+            if not red or not blu:
+                continue
+            winner = d.get("winner")
+            matches[e["id"]] = (red, blu, {int(u): ba[0] for u, ba in d.get("elos", {}).items()})
+            for p in red + blu:
+                st._stat_rec(p)["games"] += 1
+            st._stat_rec(red[0])["capt"] += 1
+            st._stat_rec(blu[0])["capt"] += 1
+            st._apply_record_counts(red, blu, winner, +1)
+            for u, ba in d.get("elos", {}).items():
+                st._stat_rec(int(u))["elo"] = ba[1]
+            n += 1
+        elif e["kind"] == "correction" and d.get("match_id") in matches:
+            red, blu, before = matches[d["match_id"]]
+            if len(before) == len(red) + len(blu):
+                st.correct_match(red, blu, before, d.get("from"), d.get("to"))
+        elif e["kind"] == "elo_adjust" and "uid" in d and "after" in d:
+            st._stat_rec(int(d["uid"]))["elo"] = int(d["after"])
+    if freeze_elo:
+        for rec in st.stats.values():
+            rec["elo"] = ELO_START
+    return st.stats, n
+
+
 # --------------------------------------------------------------------------
 # Smoke test (python pug_state.py). Seed for the Pytest suite.
 # --------------------------------------------------------------------------
@@ -1421,5 +1457,30 @@ if __name__ == "__main__":
     assert all(st[u]["elo"] == 1600 for u in red + blu)
     assert all(st[u]["d"] == 1 and st[u]["w"] == 0 and st[u]["l"] == 0 for u in red + blu)
     print("EE2) correcting to a draw zeroes the Elo move and records a draw")
+
+    # FF) rebuild_stats replays the audit log to exactly the live stats.
+    import json
+    st, log = {}, []
+    s = PugState(now=NOW, stats=st)
+    s.capt_of = {"RED": 1, "BLU": 4}
+    s.team = {"RED": [2, 3], "BLU": [5, 6]}
+    s.queue = {u: 0 for u in range(1, 7)}
+    s._bump_stats()
+    log.append({"id": 1, "kind": "match", "data": s._record_result("BLU")})
+    s._bump_stats()
+    det2 = s._record_result("RED")
+    log.append({"id": 2, "kind": "match", "data": det2})
+    before = {int(p): ba[0] for p, ba in log[0]["data"]["elos"].items()}
+    s.correct_match(log[0]["data"]["red"], log[0]["data"]["blu"], before, "BLU", "DRAW")
+    log.append({"id": 3, "kind": "correction", "data": {"match_id": 1, "from": "BLU", "to": "DRAW"}})
+    s.set_elo(2, 1700)
+    log.append({"id": 4, "kind": "elo_adjust", "data": {"uid": 2, "before": 1, "after": 1700}})
+    for e in log:                                    # JSON round-trip, as the store does
+        e["data"] = json.loads(json.dumps(e["data"]))
+    rebuilt, n = rebuild_stats(log)
+    assert n == 2 and rebuilt == st, (rebuilt, st)
+    frozen, _ = rebuild_stats(log, freeze_elo=True)
+    assert all(r["elo"] == ELO_START for r in frozen.values())
+    print("FF) rebuild_stats replays matches, corrections and Elo edits to the live stats")
 
     print("\nall smoke tests passed.")

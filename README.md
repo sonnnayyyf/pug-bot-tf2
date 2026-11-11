@@ -67,6 +67,7 @@ IDLE → QUEUING → READY_CHECK → PICKING → LIVE → (report) → IDLE
 | `/elo top` | Top 10 players by Elo rating |
 | `/elo bottom` | Bottom 10 players by Elo rating (shown with their real ladder rank) |
 | `/backup` | Admin: snapshot `pug.db` and upload it to the backup channel now |
+| `/stats rebuild` | Admin: rebuild every player's record + Elo by replaying the match log (recovers lost stats) |
 | `/match log` | List the most recent reported matches |
 | `/match info <id>` | Show one recorded match in full (rosters + before→after Elo) |
 | `/match fix <id> red\|blu\|draw` | Admin: correct a misreported match — recomputes everyone's Elo + W/L/D from the match-time ratings, no hand-math |

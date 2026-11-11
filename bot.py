@@ -30,7 +30,7 @@ from storage import Store
 from pug_state import (PugState, Phase, QUEUE_SIZE,
                        DEFAULT_AR_SECONDS, AR_COMMAND_SECONDS,
                        MAX_AR_SECONDS, READY_CHECK_SECONDS, TIMEOUT_SECONDS,
-                       ELO_START, STRAIGHT_PICK_ORDER)
+                       ELO_START, STRAIGHT_PICK_ORDER, rebuild_stats)
 
 # Load DISCORD_TOKEN / TEST_GUILD_ID / PUG_DEBUG from a local .env file if
 # python-dotenv is installed; otherwise fall back to shell environment vars.
@@ -1645,6 +1645,41 @@ async def backup_cmd(interaction: discord.Interaction):
         await interaction.followup.send(f"✅ Backup uploaded ({info} UTC).", ephemeral=True)
     else:
         await interaction.followup.send(f"⚠️ Backup failed: {info}", ephemeral=True)
+
+
+stats_group = app_commands.Group(name="stats", description="Admin: stats tools.")
+
+
+@stats_group.command(name="rebuild", description="Admin: rebuild every player's record + Elo from the match log.")
+async def stats_rebuild_cmd(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    c = ctx()
+    await interaction.response.defer(ephemeral=True)
+    events = await asyncio.to_thread(
+        c.store.all_events, ("match", "correction", "elo_adjust"))
+    if not events:
+        await interaction.followup.send("No match history found — nothing to rebuild from.",
+                                        ephemeral=True)
+        return
+    await backup_db(reason="before /stats rebuild")
+    stats, n = rebuild_stats(events, freeze_elo=not c.elo)
+    c.stats.clear()                       # in place: every lobby shares this dict
+    c.stats.update(stats)
+    # a game already live was counted at go-live but isn't in the log until reported
+    for st in guild_lobbies(c).values():
+        if st.phase is Phase.LIVE:
+            for p in st._all_players():
+                st._stat_rec(p)["games"] += 1
+            for cap in set(st.capt_of.values()):
+                st._stat_rec(cap)["capt"] += 1
+    persist()
+    await interaction.followup.send(
+        f"✅ Rebuilt stats for {len(stats)} players from {n} logged matches.", ephemeral=True)
+
+
+client.tree.add_command(stats_group)
 
 
 @client.tree.command(name="tosscoin", description="Flip a coin — heads or tails.")

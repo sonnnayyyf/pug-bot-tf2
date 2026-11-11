@@ -105,6 +105,19 @@ class Store:
         except (sqlite3.Error, json.JSONDecodeError, TypeError):
             return []
 
+    def all_events(self, kinds):
+        """Every event of the given kinds, oldest first, as {id, ts, kind, data}.
+        Returns None on error (so a caller never acts on a partial history)."""
+        try:
+            marks = ",".join("?" * len(kinds))
+            rows = self._db.execute(
+                f"SELECT id, ts, kind, blob FROM events WHERE kind IN ({marks}) "
+                "ORDER BY id ASC", tuple(kinds)).fetchall()
+            return [{"id": r[0], "ts": r[1], "kind": r[2], "data": json.loads(r[3])}
+                    for r in rows]
+        except (sqlite3.Error, json.JSONDecodeError, TypeError):
+            return None
+
 
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
